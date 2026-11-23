@@ -41238,11 +41238,81 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
 static struct {
     const ds4_model *owner;
     ds4_gpu_tensor *router[64];
-    bool router_failed;
+    ds4_gpu_tensor *engram_codes[2], *engram_scales[2];
+    ds4_gpu_tensor *indexer_codes[64], *indexer_scales[64];
+    bool router_failed, engram_failed[2], indexer_failed;
+    bool resident;
     const ds4_model *dspark_owner;
     ds4_gpu_tensor *markov_w2;
     bool markov_failed;
 } g_ds41_bf16_narrow;
+
+static void ds41_narrow_free(void) {
+    if (g_ds41_bf16_narrow.resident) {
+        (void)ds4_gpu_weight_residency(NULL, 0);
+        g_ds41_bf16_narrow.resident = false;
+    }
+    for (uint32_t i = 0; i < 64u; i++) {
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.router[i]);
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.indexer_codes[i]);
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.indexer_scales[i]);
+    }
+    for (uint32_t i = 0; i < 2u; i++) {
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.engram_codes[i]);
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.engram_scales[i]);
+    }
+    ds4_gpu_tensor_free(g_ds41_bf16_narrow.markov_w2);
+    memset(&g_ds41_bf16_narrow, 0, sizeof(g_ds41_bf16_narrow));
+}
+
+static void ds41_narrow_own(const ds4_model *m) {
+    if (g_ds41_bf16_narrow.owner == m) return;
+    if (g_ds41_bf16_narrow.resident) {
+        (void)ds4_gpu_weight_residency(NULL, 0);
+        g_ds41_bf16_narrow.resident = false;
+    }
+    for (uint32_t i = 0; i < 64u; i++) {
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.router[i]);
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.indexer_codes[i]);
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.indexer_scales[i]);
+        g_ds41_bf16_narrow.router[i] = NULL;
+        g_ds41_bf16_narrow.indexer_codes[i] = NULL;
+        g_ds41_bf16_narrow.indexer_scales[i] = NULL;
+    }
+    for (uint32_t i = 0; i < 2u; i++) {
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.engram_codes[i]);
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.engram_scales[i]);
+        g_ds41_bf16_narrow.engram_codes[i] = NULL;
+        g_ds41_bf16_narrow.engram_scales[i] = NULL;
+        g_ds41_bf16_narrow.engram_failed[i] = false;
+    }
+    g_ds41_bf16_narrow.router_failed = false;
+    g_ds41_bf16_narrow.indexer_failed = false;
+    g_ds41_bf16_narrow.owner = m;
+}
+
+static void ds41_narrow_update_residency(void) {
+    ds4_gpu_tensor *all[64u * 3u + 5u];
+    uint32_t n_all = 0;
+    for (uint32_t il = 0; il < 64u; il++) {
+        if (g_ds41_bf16_narrow.router[il]) all[n_all++] = g_ds41_bf16_narrow.router[il];
+        if (g_ds41_bf16_narrow.indexer_codes[il]) {
+            all[n_all++] = g_ds41_bf16_narrow.indexer_codes[il];
+            all[n_all++] = g_ds41_bf16_narrow.indexer_scales[il];
+        }
+    }
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (g_ds41_bf16_narrow.engram_codes[i]) {
+            all[n_all++] = g_ds41_bf16_narrow.engram_codes[i];
+            all[n_all++] = g_ds41_bf16_narrow.engram_scales[i];
+        }
+    }
+    if (g_ds41_bf16_narrow.markov_w2) all[n_all++] = g_ds41_bf16_narrow.markov_w2;
+    if (n_all) {
+        (void)ds4_gpu_weight_residency(all, n_all);
+        g_ds41_bf16_narrow.resident = true;
+    }
+}
 
 static ds4_gpu_tensor *ds41_build_bf16_exact(const ds4_model *m, const ds4_tensor *t) {
     if (!m || !t || t->type != DS4_TENSOR_F32) return NULL;
@@ -41252,7 +41322,7 @@ static ds4_gpu_tensor *ds41_build_bf16_exact(const ds4_model *m, const ds4_tenso
     for (uint64_t i = 0; i < n; i++) {
         if ((src[i] & 0xffffu) != 0u) return NULL;
     }
-    ds4_gpu_tensor *buf = ds4_gpu_tensor_alloc_untracked(n * sizeof(uint16_t));
+    ds4_gpu_tensor *buf = ds4_gpu_tensor_alloc_weights(n * sizeof(uint16_t));
     if (!buf) return NULL;
     uint16_t *dst = (uint16_t *)ds4_gpu_tensor_contents(buf);
     if (!dst) { ds4_gpu_tensor_free(buf); return NULL; }
@@ -41262,12 +41332,7 @@ static ds4_gpu_tensor *ds41_build_bf16_exact(const ds4_model *m, const ds4_tenso
 
 static ds4_gpu_tensor *ds41_router_bf16(const ds4_model *m, const ds4_layer_weights *l, uint32_t il) {
     if (getenv("DS4_METAL_DISABLE_V41_ROUTER_BF16") || il >= 64u || !l || !l->ffn_gate_inp) return NULL;
-    if (g_ds41_bf16_narrow.owner != m) {
-        for (uint32_t i = 0; i < 64u; i++) ds4_gpu_tensor_free(g_ds41_bf16_narrow.router[i]);
-        memset(g_ds41_bf16_narrow.router, 0, sizeof(g_ds41_bf16_narrow.router));
-        g_ds41_bf16_narrow.router_failed = false;
-        g_ds41_bf16_narrow.owner = m;
-    }
+    ds41_narrow_own(m);
     if (g_ds41_bf16_narrow.router_failed) return NULL;
     if (!g_ds41_bf16_narrow.router[il]) {
         g_ds41_bf16_narrow.router[il] = ds41_build_bf16_exact(m, l->ffn_gate_inp);
@@ -41292,9 +41357,150 @@ static ds4_gpu_tensor *ds41_markov_w2_bf16(const ds4_model *m, const ds4_tensor 
         } else {
             fprintf(stderr, "ds4: DSpark narrow BF16 markov_w2 enabled (%.2f MiB, bit-exact)\n",
                     (double)(t->dim[0] * t->dim[1] * sizeof(uint16_t)) / 1048576.0);
+            if (g_ds41_bf16_narrow.resident) ds41_narrow_update_residency();
         }
     }
     return g_ds41_bf16_narrow.markov_w2;
+}
+
+#if defined(__aarch64__)
+static bool ds41_e4m3_code(float q, uint8_t *code) {
+    const uint8_t sign = signbit(q) ? 0x80u : 0u;
+    const float a = fabsf(q);
+    if (a == 0.0f) { *code = sign; return true; }
+    if (!(a <= 448.0f)) return false;
+    int e;
+    const float f = frexpf(a, &e);
+    if (e - 1 >= -6) {
+        const float m = f * 16.0f - 8.0f;
+        if (m != floorf(m)) return false;
+        *code = (uint8_t)(sign | (uint8_t)((e - 1 + 7) << 3) | (uint8_t)m);
+        return true;
+    }
+    const float m = a * 512.0f;
+    if (m != floorf(m) || m < 1.0f || m > 7.0f) return false;
+    *code = (uint8_t)(sign | (uint8_t)m);
+    return true;
+}
+
+typedef struct {
+    const __fp16 *src;
+    uint64_t cols;
+    uint8_t *codes;
+    float *scales;
+    int failed;
+} ds41_e4m3_job;
+
+static void ds41_e4m3_block_row(void *context, size_t br) {
+    ds41_e4m3_job *job = context;
+    if (__atomic_load_n(&job->failed, __ATOMIC_RELAXED)) return;
+    const uint64_t cols = job->cols, bc = cols / 32u;
+    for (uint64_t bj = 0; bj < bc; bj++) {
+        float amax = 0.0f;
+        for (uint32_t r = 0; r < 32u; r++)
+            for (uint32_t j = 0; j < 32u; j++) {
+                const float v = fabsf((float)job->src[(br * 32u + r) * cols + bj * 32u + j]);
+                if (v > amax) amax = v;
+            }
+        const int e0 = amax > 0.0f ? (int)ceilf(log2f(amax / 448.0f)) : 0;
+        bool fit = false;
+        for (int d = 0; !fit && d < 3; d++) {
+            const int e = e0 + (d == 1 ? 1 : d == 2 ? -1 : 0);
+            const float inv = ldexpf(1.0f, -e);
+            fit = true;
+            for (uint32_t r = 0; fit && r < 32u; r++)
+                for (uint32_t j = 0; fit && j < 32u; j++) {
+                    const uint64_t i = (br * 32u + r) * cols + bj * 32u + j;
+                    fit = ds41_e4m3_code((float)job->src[i] * inv, &job->codes[i]);
+                }
+            if (fit) job->scales[br * bc + bj] = ldexpf(1.0f, e);
+        }
+        if (!fit) { __atomic_store_n(&job->failed, 1, __ATOMIC_RELAXED); return; }
+    }
+}
+
+static bool ds41_e4m3_build(const ds4_model *m, const ds4_tensor *t,
+                            ds4_gpu_tensor **codes_out, ds4_gpu_tensor **scales_out) {
+    const uint64_t cols = t->dim[0], rows = t->dim[1];
+    if (!cols || !rows || (cols % 32u) != 0 || (rows % 32u) != 0) return false;
+    const uint64_t f16_bytes = rows * cols * 2u;
+    if (f16_bytes > m->size || t->abs_offset > m->size - f16_bytes) return false;
+    ds4_gpu_tensor *c = ds4_gpu_tensor_alloc_weights(rows * cols);
+    ds4_gpu_tensor *sc = ds4_gpu_tensor_alloc_weights((rows / 32u) * (cols / 32u) * sizeof(float));
+    ds41_e4m3_job job = {
+        (const __fp16 *)(m->map + t->abs_offset), cols,
+        c ? (uint8_t *)ds4_gpu_tensor_contents(c) : NULL,
+        sc ? (float *)ds4_gpu_tensor_contents(sc) : NULL, 0
+    };
+    bool ok = job.codes && job.scales;
+    if (ok) {
+        dispatch_apply_f(rows / 32u, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                         &job, ds41_e4m3_block_row);
+    }
+    ok = ok && !__atomic_load_n(&job.failed, __ATOMIC_RELAXED);
+    if (!ok) {
+        ds4_gpu_tensor_free(c);
+        ds4_gpu_tensor_free(sc);
+        return false;
+    }
+    *codes_out = c;
+    *scales_out = sc;
+    return true;
+}
+#endif
+
+static bool ds41_engram_e4m3(const ds4_model *m, const ds4_layer_weights *l, uint32_t table,
+                             ds4_gpu_tensor **codes_out, ds4_gpu_tensor **scales_out) {
+#if defined(__aarch64__)
+    const ds4_tensor *t = l ? l->engram_kv : NULL;
+    if (getenv("DS4_METAL_DISABLE_V41_ENGRAM_E4M3") || table > 1u || !t || t->type != DS4_TENSOR_F16 ||
+        t->dim[0] % 32u || t->dim[1] % 32u) return false;
+    ds41_narrow_own(m);
+    if (g_ds41_bf16_narrow.engram_failed[table]) return false;
+    if (!g_ds41_bf16_narrow.engram_codes[table] &&
+        !ds41_e4m3_build(m, t, &g_ds41_bf16_narrow.engram_codes[table],
+                         &g_ds41_bf16_narrow.engram_scales[table])) {
+        g_ds41_bf16_narrow.engram_failed[table] = true;
+        fprintf(stderr, "ds4: V4.1 Engram table %u keeps F16 weights (not exact E4M3)\n", table);
+        return false;
+    }
+    *codes_out = g_ds41_bf16_narrow.engram_codes[table];
+    *scales_out = g_ds41_bf16_narrow.engram_scales[table];
+    return true;
+#else
+    (void)m; (void)l; (void)table; (void)codes_out; (void)scales_out;
+    return false;
+#endif
+}
+
+static bool ds41_indexer_e4m3(const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                              ds4_gpu_tensor **codes_out, ds4_gpu_tensor **scales_out) {
+#if defined(__aarch64__)
+    const ds4_tensor *t = l ? l->indexer_attn_q_b : NULL;
+    if (getenv("DS4_METAL_DISABLE_V41_INDEXER_E4M3") || il >= 64u || !t || t->type != DS4_TENSOR_F16 ||
+        t->dim[0] % 32u || t->dim[1] % 32u) return false;
+    ds41_narrow_own(m);
+    if (g_ds41_bf16_narrow.indexer_failed) return false;
+    if (!g_ds41_bf16_narrow.indexer_codes[il] &&
+        !ds41_e4m3_build(m, t, &g_ds41_bf16_narrow.indexer_codes[il],
+                         &g_ds41_bf16_narrow.indexer_scales[il])) {
+        for (uint32_t i = 0; i < 64u; i++) {
+            ds4_gpu_tensor_free(g_ds41_bf16_narrow.indexer_codes[i]);
+            ds4_gpu_tensor_free(g_ds41_bf16_narrow.indexer_scales[i]);
+            g_ds41_bf16_narrow.indexer_codes[i] = NULL;
+            g_ds41_bf16_narrow.indexer_scales[i] = NULL;
+        }
+        g_ds41_bf16_narrow.indexer_failed = true;
+        fprintf(stderr, "ds4: V4.1 indexer q_b keeps F16 weights (layer %u not exact E4M3)\n", il);
+        return false;
+    }
+    *codes_out = g_ds41_bf16_narrow.indexer_codes[il];
+    *scales_out = g_ds41_bf16_narrow.indexer_scales[il];
+    return true;
+#else
+    (void)m; (void)l; (void)il; (void)codes_out; (void)scales_out;
+    return false;
+#endif
 }
 #endif
 
@@ -41418,15 +41624,34 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->engram_reader = ds4_engram_reader_create();
     ds41_graph_reset(g);
 #ifdef __APPLE__
-    if (!streaming && g_ds41_bf16_narrow.owner != m && !getenv("DS4_METAL_DISABLE_V41_ROUTER_BF16")) {
-        uint32_t built = 0;
+    if (!streaming && g_ds41_bf16_narrow.owner != m) {
+        uint32_t r_built = 0, e_built = 0, i_built = 0;
+        uint64_t e4m3_bytes = 0;
+        ds4_gpu_tensor *codes = NULL, *scales = NULL;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (ds41_router_bf16(m, &w->layer[il], il)) built++;
+            if (ds41_router_bf16(m, &w->layer[il], il)) r_built++;
+            if (ds41_engram_layer(il) &&
+                ds41_engram_e4m3(m, &w->layer[il], il == 1 ? 0u : 1u, &codes, &scales)) {
+                e_built++;
+                e4m3_bytes += w->layer[il].engram_kv->dim[0] * w->layer[il].engram_kv->dim[1] +
+                    (w->layer[il].engram_kv->dim[0] / 32u) * (w->layer[il].engram_kv->dim[1] / 32u) * sizeof(float);
+            }
+            if (ds41_index_source(il) &&
+                ds41_indexer_e4m3(m, &w->layer[il], il, &codes, &scales)) {
+                i_built++;
+                e4m3_bytes += w->layer[il].indexer_attn_q_b->dim[0] * w->layer[il].indexer_attn_q_b->dim[1] +
+                    (w->layer[il].indexer_attn_q_b->dim[0] / 32u) * (w->layer[il].indexer_attn_q_b->dim[1] / 32u) * sizeof(float);
+            }
         }
-        if (built == DS4_N_LAYER) {
+        if (r_built == DS4_N_LAYER) {
             fprintf(stderr, "ds4: V4.1 narrow BF16 router enabled (%u layers, %.2f MiB, bit-exact)\n",
-                    built, (double)built * DS4_N_EMBD * DS4_N_EXPERT * sizeof(uint16_t) / 1048576.0);
+                    r_built, (double)r_built * DS4_N_EMBD * DS4_N_EXPERT * sizeof(uint16_t) / 1048576.0);
         }
+        if (e_built || i_built) {
+            fprintf(stderr, "ds4: V4.1 narrow E4M3 enabled (engram %u/2, indexer %u/8, %.2f MiB, bit-exact)\n",
+                    e_built, i_built, (double)e4m3_bytes / 1048576.0);
+        }
+        ds41_narrow_update_residency();
     }
 #endif
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
@@ -41847,8 +42072,20 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
+        bool idx_q_ok = true;
+        if (!g->batch_prepass) {
+#ifdef __APPLE__
+            ds4_gpu_tensor *ic = NULL, *is = NULL;
+            const bool e4m3 = !g->quality && ds41_indexer_e4m3(m, l, il, &ic, &is) &&
+                ds4_gpu_matmul_e4m3_bf16_rows_tensor(g->index_q, ic, is,
+                    l->indexer_attn_q_b->dim[0], l->indexer_attn_q_b->dim[1], g->qr, 1);
+            idx_q_ok = e4m3 || ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true);
+#else
+            idx_q_ok = ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true);
+#endif
+        }
         if ((!g->batch_prepass &&
-             (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
+             (!idx_q_ok ||
               !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
               !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
               !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true))) ||
@@ -42147,7 +42384,16 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, i ? g->engram_rows2 : g->engram_rows, true) ||
+        const ds4_gpu_tensor *rows = i ? g->engram_rows2 : g->engram_rows;
+#ifdef __APPLE__
+        ds4_gpu_tensor *ec = NULL, *es = NULL;
+        const bool e4m3 = !g->quality && ds41_engram_e4m3(m, l, i, &ec, &es) &&
+            ds4_gpu_matmul_e4m3_bf16_rows_tensor(g->engram_kv, ec, es,
+                l->engram_kv->dim[0], l->engram_kv->dim[1], rows, 1);
+#else
+        const bool e4m3 = false;
+#endif
+        if ((!e4m3 && !ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true)) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
@@ -42246,7 +42492,16 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          uint32_t il, uint32_t count) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
+#ifdef __APPLE__
+        ds4_gpu_tensor *ec = NULL, *es = NULL;
+        const bool e4m3 = !g->quality && count >= 1u && count <= 8u &&
+            ds41_engram_e4m3(m, l, i, &ec, &es) &&
+            ds4_gpu_matmul_e4m3_bf16_rows_tensor(b->engram_kv, ec, es,
+                l->engram_kv->dim[0], l->engram_kv->dim[1], b->engram_rows, count);
+#else
+        const bool e4m3 = false;
+#endif
+        if ((!e4m3 && !ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true)) ||
             !ds4_gpu_dsv41_engram_add(b->residual, b->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], g->image_count ? g->image_text_mask : NULL,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
@@ -42363,13 +42618,24 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                 !ds4_gpu_dsv41_quantize(r->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
                 !ds41_matmul(r->index_weights, m, l->indexer_proj, r->norm, true)) return false;
         }
-    } else if (!ds41_project_rows(b->index_q, m, l->indexer_attn_q_b, b->qr, count, true) ||
-               !ds4_gpu_dsv41_rope(b->index_q, DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_HEAD,
-                                   count, start, true, false) ||
-               !ds4_gpu_dsv41_quantize(b->index_q, DS4_N_INDEXER_HEAD_DIM,
-                   count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-               !ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
-        return false;
+    } else {
+        bool idx_q_ok = false;
+#ifdef __APPLE__
+        ds4_gpu_tensor *ic = NULL, *is = NULL;
+        if (!g->quality && count >= 1u && count <= 8u && ds41_indexer_e4m3(m, l, il, &ic, &is)) {
+            idx_q_ok = ds4_gpu_matmul_e4m3_bf16_rows_tensor(b->index_q, ic, is,
+                l->indexer_attn_q_b->dim[0], l->indexer_attn_q_b->dim[1], b->qr, count) != 0;
+        }
+#endif
+        if (!idx_q_ok) idx_q_ok = ds41_project_rows(b->index_q, m, l->indexer_attn_q_b, b->qr, count, true);
+        if (!idx_q_ok ||
+            !ds4_gpu_dsv41_rope(b->index_q, DS4_N_INDEXER_HEAD_DIM, DS4_N_INDEXER_HEAD,
+                                count, start, true, false) ||
+            !ds4_gpu_dsv41_quantize(b->index_q, DS4_N_INDEXER_HEAD_DIM,
+                count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
+            !ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
+            return false;
+    }
     ds41_gpu_graph row = *g;
     /* Only 32 score rows are live. Batched sorting retains the original
      * per-row causal width, including padding and tie order. */
@@ -43727,15 +43993,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 (ratio != 2 || ds41_matmul_batch(active.pool_score, model,
                     l->attn_compressor_gate, active.norm, rows, false));
         }
-        if (ok && batch_prepass && ds41_index_source(il))
-            ok = ds41_matmul_batch(active.index_q, model, l->indexer_attn_q_b, active.qr,
-                                   rows, true) &&
+        if (ok && batch_prepass && ds41_index_source(il)) {
+            ds4_gpu_tensor *ic = NULL, *is = NULL;
+            const bool e4m3 = !g->quality && rows >= 1u && rows <= 8u &&
+                ds41_indexer_e4m3(model, l, il, &ic, &is) &&
+                ds4_gpu_matmul_e4m3_bf16_rows_tensor(active.index_q, ic, is,
+                    l->indexer_attn_q_b->dim[0], l->indexer_attn_q_b->dim[1], active.qr, rows);
+            ok = (e4m3 || ds41_matmul_batch(active.index_q, model, l->indexer_attn_q_b, active.qr,
+                                            rows, true)) &&
                 ds4_gpu_dsv41_rope_rows(active.index_q, 128, DS4_N_INDEXER_HEAD, rows,
                                         positions, compressed, false) &&
                 ds4_gpu_dsv41_quantize(active.index_q, 128, DS4_N_INDEXER_HEAD * rows,
                                        DS4_V41_FP4_E8M0) &&
                 ds41_matmul_batch(active.index_weights, model, l->indexer_proj, active.norm,
                                   rows, true);
+        }
 #endif
         /* Past ~2K tokens every row attends 128 raw + 512 compressed keys;
          * with equal key counts all rows share one attention dispatch. Before
@@ -72988,6 +73260,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e->backend == DS4_BACKEND_METAL)
+        ds4_gpu_set_model_untracked_default(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
+#endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
         opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
         fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
@@ -75227,6 +75503,9 @@ void ds4_engine_close(ds4_engine *e) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
+#ifdef __APPLE__
+    ds41_narrow_free();
+#endif
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);

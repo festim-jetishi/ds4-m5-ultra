@@ -1191,6 +1191,19 @@ int ds4_gpu_matmul_bf16_k256_add_tensor(
         const ds4_gpu_tensor *weights_bf16,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x);
+#ifdef __APPLE__
+void ds4_gpu_set_model_untracked_default(int on);
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
+int ds4_gpu_matmul_e4m3_bf16_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *codes,
+        const ds4_gpu_tensor *scales,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows);
+#endif
 
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,

@@ -431,6 +431,9 @@ static id<MTLComputePipelineState> g_unary_fill_pipeline;
 static id<MTLComputePipelineState> g_unary_fill_f16_pipeline;
 static id<MTLComputePipelineState> g_bin_mul_scalar_pipeline;
 static id<MTLComputePipelineState> g_bin_div_row_pipeline;
+static id<MTLComputePipelineState> g_bf16_r1_rows_pipeline;
+static id<MTLComputePipelineState> g_bf16_k256_add_pipeline;
+static id<MTLComputePipelineState> g_e4m3_8b_r2_pipelines[8];
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
@@ -1635,9 +1638,13 @@ static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
            strcmp(label, "ds4_attention_output_group_ids") == 0;
 }
 
+static int g_model_untracked_default;
+void ds4_gpu_set_model_untracked_default(int on) { g_model_untracked_default = on != 0; }
+
 static MTLResourceOptions ds4_gpu_model_resource_options(void) {
     MTLResourceOptions options = MTLResourceStorageModeShared;
-    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL) {
+    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL ||
+        (g_model_untracked_default && getenv("DS4_METAL_MODEL_TRACKED") == NULL)) {
         options |= MTLResourceHazardTrackingModeUntracked;
     }
     return options;
@@ -9301,6 +9308,83 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc_untracked(uint64_t bytes) {
     }
 }
 
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
+    @autoreleasepool {
+        DS4MetalTensor *tensor = [DS4MetalTensor new];
+        tensor.buffer = [g_device newBufferWithLength:(NSUInteger)bytes
+                                              options:ds4_gpu_model_resource_options()];
+        if (!tensor.buffer) return NULL;
+        tensor.offset = 0;
+        tensor.bytes = bytes;
+        tensor.owner = 1;
+        uint64_t live_snap = 0;
+        uint64_t peak_snap = 0;
+        pthread_mutex_lock(&g_tensor_mu);
+        const int tracked = ds4_gpu_tensor_track_alloc_locked(
+                (__bridge const void *)tensor, bytes, &live_snap, &peak_snap);
+        pthread_mutex_unlock(&g_tensor_mu);
+        if (!tracked) {
+            tensor.buffer = nil;
+            return NULL;
+        }
+        return (__bridge_retained ds4_gpu_tensor *)tensor;
+    }
+}
+
+static id g_weight_residency_set;
+static int g_weight_residency_added_to_queue;
+static void ds4_gpu_weight_residency_clear(void) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_weight_residency_set) {
+            if (g_weight_residency_added_to_queue && g_queue &&
+                [g_queue respondsToSelector:@selector(removeResidencySet:)]) {
+                [g_queue removeResidencySet:g_weight_residency_set];
+            }
+            [g_weight_residency_set endResidency];
+            [g_weight_residency_set removeAllAllocations];
+            g_weight_residency_set = nil;
+        }
+    }
+#endif
+    g_weight_residency_added_to_queue = 0;
+}
+
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n) {
+    ds4_gpu_weight_residency_clear();
+    if (!n || !g_device || g_ssd_streaming_mode || g_model_residency_skipped ||
+        getenv("DS4_METAL_NO_RESIDENCY") != NULL) {
+        return 1;
+    }
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"ds4_built_weights";
+        desc.initialCapacity = n;
+        NSError *error = nil;
+        g_weight_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (!g_weight_residency_set) {
+            fprintf(stderr, "ds4: Metal built-weight residency set creation failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            return 0;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            if (tensors[i]) [g_weight_residency_set addAllocation:ds4_gpu_tensor_buffer(tensors[i])];
+        }
+        [g_weight_residency_set commit];
+        [g_weight_residency_set requestResidency];
+        if (getenv("DS4_METAL_DISABLE_QUEUE_RESIDENCY_SET") == NULL && g_queue &&
+            [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [g_queue addResidencySet:g_weight_residency_set];
+            g_weight_residency_added_to_queue = 1;
+        }
+    }
+#endif
+    return 1;
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return ds4_gpu_tensor_alloc(bytes);
 }
@@ -11986,7 +12070,11 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache_evictions = 0;
         g_model_buffer_cache_over_limit = 0;
         ds4_gpu_model_residency_clear();
+        ds4_gpu_weight_residency_clear();
         ds4_gpu_model_views_clear();
+        g_bf16_r1_rows_pipeline = nil;
+        g_bf16_k256_add_pipeline = nil;
+        for (int i = 0; i < 8; i++) g_e4m3_8b_r2_pipelines[i] = nil;
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
         [g_q4_expert_layer_residency_cache removeAllObjects];
@@ -22303,8 +22391,88 @@ int ds4_gpu_matmul_f32_rows_exact_tensor(
                                           in_dim, out_dim, x, n_rows, true);
 }
 
-static id<MTLComputePipelineState> g_bf16_r1_rows_pipeline;
-static id<MTLComputePipelineState> g_bf16_k256_add_pipeline;
+int ds4_gpu_matmul_e4m3_bf16_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *codes,
+        const ds4_gpu_tensor *scales,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_quality_mode || !out || !codes || !scales || !x ||
+        n_rows < 1u || n_rows > 8u ||
+        in_dim < 32u || (in_dim % 32u) != 0 || (out_dim % 32u) != 0 ||
+        in_dim > INT32_MAX || out_dim > INT32_MAX) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> cbuf = ds4_gpu_tensor_buffer(codes);
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer(scales);
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!cbuf || !sbuf || !xbuf || !outbuf ||
+            (ds4_gpu_tensor_offset(codes) % 8u) != 0 ||
+            ds4_gpu_tensor_bytes(codes) < in_dim * out_dim ||
+            ds4_gpu_tensor_bytes(scales) < (in_dim / 32u) * (out_dim / 32u) * sizeof(float) ||
+            ds4_gpu_tensor_bytes(x) < (uint64_t)n_rows * in_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) {
+            return 0;
+        }
+        static const char *const k_names[8] = {
+            "kernel_dsv41_e4m3_8b_r2_rows1_bf16",
+            "kernel_dsv41_e4m3_8b_r2_rows2_bf16",
+            "kernel_dsv41_e4m3_8b_r2_rows3_bf16",
+            "kernel_dsv41_e4m3_8b_r2_rows4_bf16",
+            "kernel_dsv41_e4m3_8b_r2_rows5_bf16",
+            "kernel_dsv41_e4m3_8b_r2_rows6_bf16",
+            "kernel_dsv41_e4m3_8b_r2_rows7_bf16",
+            "kernel_dsv41_e4m3_8b_r2_rows8_bf16",
+        };
+        id<MTLComputePipelineState> pipeline = g_e4m3_8b_r2_pipelines[n_rows - 1u];
+        if (!pipeline) {
+            pipeline = ds4_gpu_get_mul_mv_pipeline(k_names[n_rows - 1u], 4);
+            if (!pipeline) return 0;
+            g_e4m3_8b_r2_pipelines[n_rows - 1u] = pipeline;
+        }
+        ds4_gpu_f16_matvec_args args = {
+            .ne00 = (int32_t)in_dim,
+            .ne01 = (int32_t)out_dim,
+            .ne02 = 1,
+            .nb00 = 1,
+            .nb01 = in_dim,
+            .nb02 = in_dim * out_dim,
+            .nb03 = in_dim * out_dim,
+            .ne10 = (int32_t)in_dim,
+            .ne11 = (int32_t)n_rows,
+            .ne12 = 1,
+            .nb10 = sizeof(float),
+            .nb11 = in_dim * sizeof(float),
+            .nb12 = (uint64_t)n_rows * in_dim * sizeof(float),
+            .nb13 = (uint64_t)n_rows * in_dim * sizeof(float),
+            .ne0  = (int32_t)out_dim,
+            .ne1  = (int32_t)n_rows,
+            .r2   = 1,
+            .r3   = 1,
+            .nr0  = 2,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:cbuf offset:ds4_gpu_tensor_offset(codes) atIndex:1];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(scales) atIndex:2];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        const NSUInteger rows_per_tg = 8u; /* NSG=4 * 2 rows/SG */
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_per_tg - 1u) / rows_per_tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "E4M3 BF16 narrow rows matvec");
+    }
+}
 
 int ds4_gpu_matmul_bf16_buf_rows_tensor(
         ds4_gpu_tensor       *out,

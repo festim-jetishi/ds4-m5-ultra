@@ -2020,6 +2020,102 @@ DS4_F16_ROWS_1SG_KERNEL(7)
 DS4_F16_ROWS_1SG_KERNEL(8)
 #undef DS4_F16_ROWS_1SG_KERNEL
 
+// Exact E4M3 decode via F16 bit-shift (value / 256, subnormals included).
+static inline float4 ds4_e4m3_dec4(uint w) {
+    const half2 a = as_type<half2>(((w << 7) & 0x3f803f80u) | ((w << 8) & 0x80008000u));
+    const half2 b = as_type<half2>(((w >> 1) & 0x3f803f80u) | (w & 0x80008000u));
+    return float4(float(a.x), float(b.x), float(a.y), float(b.y));
+}
+
+// 1-SG-per-2-rows, 8B/lane (uint2), zero-shmem zero-barrier E4M3 matvec/multi-row (M=1..8)
+// with fused BF16 output rounding. Both rows r0, r0+1 sit in the same 32x32 scale block,
+// sharing sx[ib] and X loads across 2 rows and pre-decoding weights once across all NR1 tokens.
+// ne00 % 32 == 0, ne01 % 32 == 0, codes 8-byte aligned.
+template<short NR1>
+static inline void kernel_dsv41_e4m3_8b_r2_rows_bf16_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const uchar * codes,
+        device const float * scales,
+        device const char  * src1,
+        device       char  * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const int r0 = (int)((tgpig.x * (uint)NSG + (uint)sgitg) * 2u);
+    if (r0 >= args.ne01) return;
+
+    const int nb = args.ne00 / 32;
+    const int n4 = args.ne00 / 4;
+    const int k8 = args.ne00 / 8;
+    device const uint2 * ax0 = (device const uint2 *)(codes + (uint64_t)r0 * (uint64_t)args.ne00);
+    device const uint2 * ax1 = ax0 + k8;
+    device const float * sx  = scales + (uint64_t)(r0 / 32) * (uint64_t)nb;
+    device const float4 * X  = (device const float4 *)src1;
+    device float * Y         = (device float *)dst;
+
+    const short ix = tiisg >> 2; // 0..7
+    const short il = tiisg & 3;  // 0..3
+
+    float s0[NR1];
+    float s1[NR1];
+    FOR_UNROLL (short t = 0; t < NR1; ++t) {
+        s0[t] = 0.f;
+        s1[t] = 0.f;
+    }
+
+    for (int ib = ix; ib < nb; ib += 8) {
+        const float s256 = sx[ib] * 256.0f;
+        const int woff = ib * 4 + il;
+        const uint2 w0 = ax0[woff];
+        const uint2 w1 = ax1[woff];
+        const float4 f00 = ds4_e4m3_dec4(w0.x) * s256;
+        const float4 f01 = ds4_e4m3_dec4(w0.y) * s256;
+        const float4 f10 = ds4_e4m3_dec4(w1.x) * s256;
+        const float4 f11 = ds4_e4m3_dec4(w1.y) * s256;
+        const int yoff = ib * 8 + il * 2;
+        FOR_UNROLL (short t = 0; t < NR1; ++t) {
+            device const float4 * yt = X + (uint64_t)t * (uint64_t)n4 + yoff;
+            const float4 y0 = yt[0];
+            const float4 y1 = yt[1];
+            s0[t] += dot(f00, y0) + dot(f01, y1);
+            s1[t] += dot(f10, y0) + dot(f11, y1);
+        }
+    }
+
+    FOR_UNROLL (short t = 0; t < NR1; ++t) {
+        const float t0 = simd_sum(s0[t]);
+        const float t1 = simd_sum(s1[t]);
+        if (tiisg == 0) {
+            Y[(uint64_t)t * (uint64_t)args.ne0 + r0]     = ds4_round_bf16(t0);
+            Y[(uint64_t)t * (uint64_t)args.ne0 + r0 + 1] = ds4_round_bf16(t1);
+        }
+    }
+}
+
+#define DS4_E4M3_8B_R2_KERNEL(R) \
+[[host_name("kernel_dsv41_e4m3_8b_r2_rows" #R "_bf16")]] \
+kernel void kernel_dsv41_e4m3_8b_r2_rows##R##_bf16( \
+        constant ds4_metal_args_mul_mv & args [[buffer(0)]], \
+        device const uchar * codes  [[buffer(1)]], \
+        device const float * scales [[buffer(2)]], \
+        device const char  * src1   [[buffer(3)]], \
+        device       char  * dst    [[buffer(4)]], \
+        uint3  tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], \
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv41_e4m3_8b_r2_rows_bf16_impl<R>(args, codes, scales, src1, dst, tgpig, tiisg, sgitg); \
+}
+DS4_E4M3_8B_R2_KERNEL(1)
+DS4_E4M3_8B_R2_KERNEL(2)
+DS4_E4M3_8B_R2_KERNEL(3)
+DS4_E4M3_8B_R2_KERNEL(4)
+DS4_E4M3_8B_R2_KERNEL(5)
+DS4_E4M3_8B_R2_KERNEL(6)
+DS4_E4M3_8B_R2_KERNEL(7)
+DS4_E4M3_8B_R2_KERNEL(8)
+#undef DS4_E4M3_8B_R2_KERNEL
+
 [[host_name("kernel_mul_mv_f32_f32_4_rows")]]
 kernel void kernel_mul_mv_f32_f32_4_rows(
         constant ds4_metal_args_mul_mv & args,
