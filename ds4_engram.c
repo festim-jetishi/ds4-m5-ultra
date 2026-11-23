@@ -330,7 +330,7 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     return ok;
 }
 
-enum { TOKEN_READERS = 4 };
+enum { TOKEN_READERS = 8 };
 
 typedef struct {
     pthread_t thread;

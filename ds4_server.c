@@ -10034,8 +10034,14 @@ struct server_slot {
     bool decode_done;
     int decode_token;
     bool decode_speculative;
-    int decode_accepted[2];
+    int decode_accepted[17];
     int decode_accepted_count;
+    /* A solo DSpark step speculates with the request's own limits and sampler. */
+    int decode_max_tokens, decode_eos, decode_top_k;
+    float decode_temperature, decode_top_p, decode_min_p;
+    uint64_t *decode_rng;
+    bool decode_ignore_eos;
+    ds4_think_mode decode_think_mode;
     int decode_rc;
     char decode_err[160];
 };
@@ -10160,9 +10166,13 @@ struct server {
     pthread_cond_t model_cv;
     bool model_busy;
     bool qwen4_batch_mtp;
+    /* DeepSeek DSpark has no batched verifier: a request decoding alone
+     * speculates, concurrent requests take ordinary batched steps. */
+    bool dspark_solo;
     bool model_stopping;
     int decode_pending;
     int active_generations;
+    int prefill_quantum;
     int mixed_prefill_quantum;
     int last_prefill_slot;
     pthread_mutex_t mu;
@@ -11200,6 +11210,54 @@ static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     int user_token_id,
                                     int assistant_token_id) {
     return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
+}
+
+/* Number of leading prompt tokens whose text lies within, and matches, the
+ * first bytes of the rendered prompt text.  Counting token texts (as the disk
+ * keys do) also works for prompts rebuilt from a checkpoint plus a suffix. */
+static int kv_cache_tokens_within(server *s, const ds4_tokens *prompt,
+                                  const char *text, size_t bytes) {
+    size_t off = 0;
+    int n = 0;
+    while (n < prompt->len) {
+        size_t len = 0;
+        char *piece = ds4_token_text(s->engine, prompt->v[n], &len);
+        const bool fits = off + len <= bytes && !memcmp(text + off, piece, len);
+        free(piece);
+        if (!fits) break;
+        off += len;
+        n++;
+    }
+    return n;
+}
+
+/* Agent clients send one tool block for every session, followed by a system
+ * prompt that names the working folder.  DeepSeek prompts render the tools
+ * first, so the end of the tool block is a prefix shared across projects.
+ * Returns its token position in prompt, or -1. */
+static int kv_cache_tools_anchor_pos(server *s, const request *req,
+                                     const ds4_tokens *prompt) {
+    static const char end_marker[] = "Use the exact parameter names from the schemas.";
+    if (!req->has_tools || !req->prompt_text) return -1;
+    const char *tools = strstr(req->prompt_text, "## Tools\n\n");
+    const char *end = tools ? strstr(tools, end_marker) : NULL;
+    if (!end) return -1;
+    end += sizeof(end_marker) - 1;
+    return kv_cache_tokens_within(s, prompt, req->prompt_text,
+                                  (size_t)(end - req->prompt_text));
+}
+
+/* Where this prompt stops matching the closest cached prompt, e.g. inside the
+ * working folder of an agent's system prompt (T3 Code gives each new thread
+ * its own scratch folder).  Returns its token position in prompt, or -1. */
+static int kv_cache_shared_anchor_pos(server *s, const request *req,
+                                      const ds4_tokens *prompt) {
+    if (!req->prompt_text) return -1;
+    pthread_mutex_lock(&s->kv_mu);
+    const size_t bytes = ds4_kvstore_longest_shared_text(&s->kv, req->prompt_text,
+                                                         ds4_engine_model_id(s->engine));
+    pthread_mutex_unlock(&s->kv_mu);
+    return bytes ? kv_cache_tokens_within(s, prompt, req->prompt_text, bytes) : -1;
 }
 
 
@@ -12409,7 +12467,12 @@ static void server_prefill_leave(server *s) {
 
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    /* Prompt calls of 2816+ tokens take V4.1's decoder-suffix prefill: an
+     * 18K prompt took 21.6 s in 2048-token calls, 13.6 s in 8192 ones; with
+     * 8K prompts arriving during another request's decode, mean time to
+     * first token fell from 66 s (128-token mixed calls) to 13-20 s (4096). */
+    int quantum = generation_active ? s->mixed_prefill_quantum :
+        s->prefill_quantum > 0 ? s->prefill_quantum : 8192;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -13188,7 +13251,7 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
 }
 
 static int server_eval_tokens(server *s, server_slot *slot, int token,
-                              bool speculative, int accepted[2], int *n_accepted,
+                              bool speculative, int *accepted, int *n_accepted,
                               char *err, size_t errlen) {
     *n_accepted = 0;
     if (!s || !slot) return 1;
@@ -13283,11 +13346,26 @@ static void timespec_add_us(struct timespec *ts, long us) {
     ts->tv_nsec %= 1000000000L;
 }
 
+#define DS4_SERVER_DSPARK_BATCH_LIMIT 8
+/* Most requests whose DSpark drafts share one verify batch (default 2;
+ * DS4_SERVER_DSPARK_BATCH=1 turns sharing off). */
+static int server_dspark_batch_max(void) {
+    static int max = -1;
+    if (max < 0) {
+        const char *v = getenv("DS4_SERVER_DSPARK_BATCH");
+        max = v ? atoi(v) : 2;
+        if (max < 1) max = 1;
+        if (max > DS4_SERVER_DSPARK_BATCH_LIMIT) max = DS4_SERVER_DSPARK_BATCH_LIMIT;
+    }
+    return max;
+}
+
 static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
-    int (*accepted)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
+    int (*accepted)[17] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
+    int (*accepted2)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted2));
     int *n_accepted = xmalloc((size_t)s->slot_count * sizeof(*n_accepted));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
@@ -13336,6 +13414,13 @@ static void *decode_worker_main(void *arg) {
             if (!speculative) plain_count = count;
         }
         if (count == 0) continue;
+        const bool solo = s->dspark_solo && count == 1 && plain_count == 0;
+        /* Two speculating requests: both drafts in one verify batch (about a
+         * fifth more output than plain two-row steps on code). More requests
+         * decode plainly: their draft rows would crowd the 8-row batch. */
+        const bool dspark_batch = s->dspark_solo && plain_count == 0 &&
+            count >= 2 && count <= server_dspark_batch_max();
+        if (s->dspark_solo && !solo && !dspark_batch) plain_count = count;
         s->model_busy = true;
         pthread_mutex_unlock(&s->model_mu);
 
@@ -13348,9 +13433,37 @@ static void *decode_worker_main(void *arg) {
             accepted[i][0] = items[i].token;
             n_accepted[i] = 1;
         }
-        if (rc == 0 && count > plain_count)
+        if (rc == 0 && dspark_batch) {
+            int max_tokens[DS4_SERVER_DSPARK_BATCH_LIMIT], eos[DS4_SERVER_DSPARK_BATCH_LIMIT];
+            bool ignore_eos[DS4_SERVER_DSPARK_BATCH_LIMIT];
+            ds4_think_mode think[DS4_SERVER_DSPARK_BATCH_LIMIT];
+            for (int i = 0; i < count; i++) {
+                max_tokens[i] = members[i]->decode_max_tokens;
+                eos[i] = members[i]->decode_eos;
+                ignore_eos[i] = members[i]->decode_ignore_eos;
+                think[i] = members[i]->decode_think_mode;
+            }
+            rc = ds4_sessions_eval_batch_dspark(items, count, max_tokens, eos, ignore_eos, think,
+                    accepted, n_accepted, batch_err, sizeof(batch_err));
+        } else if (rc == 0 && solo) {
+            const server_slot *m = members[0];
+            const int cap = (int)(sizeof(accepted[0]) / sizeof(accepted[0][0]));
+            const int n = m->decode_ignore_eos ?
+                ds4_session_eval_speculative_argmax_ignoring_eos(items[0].session, items[0].token,
+                    m->decode_max_tokens, m->decode_eos, m->decode_think_mode,
+                    accepted[0], cap, batch_err, sizeof(batch_err)) :
+                ds4_session_eval_speculative(items[0].session, items[0].token,
+                    m->decode_max_tokens, m->decode_eos, m->decode_temperature, m->decode_top_k,
+                    m->decode_top_p, m->decode_min_p, m->decode_rng,
+                    accepted[0], cap, batch_err, sizeof(batch_err));
+            if (n > 0) n_accepted[0] = n;
+            else rc = n < 0 ? n : 1;
+        } else if (rc == 0 && count > plain_count) {
             rc = ds4_sessions_eval_batch_speculative_argmax(items + plain_count, count - plain_count,
-                    accepted + plain_count, n_accepted + plain_count, batch_err, sizeof(batch_err));
+                    accepted2 + plain_count, n_accepted + plain_count, batch_err, sizeof(batch_err));
+            for (int i = plain_count; rc == 0 && i < count; i++)
+                memcpy(accepted[i], accepted2[i], (size_t)n_accepted[i] * sizeof(int));
+        }
         if (rc != 0)
             for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
         pthread_mutex_unlock(&s->inference_mu);
@@ -13383,6 +13496,7 @@ static void *decode_worker_main(void *arg) {
     free(members);
     free(items);
     free(accepted);
+    free(accepted2);
     free(n_accepted);
     return NULL;
 }
@@ -13704,7 +13818,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
+    int tools_store_len = 0;
+    int shared_store_len = 0;
+    /* A disk hit can stop short of the anchor (a tools checkpoint), so the
+     * anchor is still worth writing for the next session in this folder. */
+    if (!multimodal && (cached == 0 || disk_cached > 0) &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -13713,8 +13831,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
                                                     ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        cold_store_len = anchor >= s->kv.opt.min_tokens ? anchor :
+                         cached == 0 ? kv_cache_store_len(&s->kv, prompt_for_sync->len) : 0;
+        if (cold_store_len <= cached) cold_store_len = 0;
+        const int tools = kv_cache_tools_anchor_pos(s, &j->req, prompt_for_sync);
+        const int limit = cold_store_len > 0 ? cold_store_len : prompt_for_sync->len;
+        if (tools >= s->kv.opt.min_tokens && tools > cached && tools < limit)
+            tools_store_len = tools;
+        const int shared = kv_cache_shared_anchor_pos(s, &j->req, prompt_for_sync);
+        const int below = tools_store_len > cached ? tools_store_len : cached;
+        if (shared >= below + s->kv.opt.min_tokens && shared < limit)
+            shared_store_len = shared;
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -13728,12 +13855,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             kv_cache_slot_suppress_continued(s, slot, cold_store_len);
     }
 
-    if (s->kv.enabled &&
-        cold_store_len >= s->kv.opt.min_tokens &&
-        cold_store_len < prompt_for_sync->len)
-    {
+    for (int pass = 0; pass < 3; pass++) {
+        const bool cold = pass == 2;
+        const int store_len = pass == 0 ? tools_store_len :
+                              pass == 1 ? shared_store_len : cold_store_len;
+        if (!s->kv.enabled ||
+            store_len < s->kv.opt.min_tokens ||
+            store_len >= prompt_for_sync->len) continue;
         ds4_tokens prefix = {0};
-        tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
+        tokens_copy_prefix(&prefix, prompt_for_sync, store_len);
         if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
@@ -13753,10 +13883,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             return;
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
-                                       cold_store_len, "cold")) {
-            kv_cache_slot_note_store(slot, cold_store_len);
-            suppressed_continued_last = -1;
-        } else {
+                                       store_len, pass == 0 ? "tools" :
+                                       pass == 1 ? "shared" : "cold")) {
+            kv_cache_slot_note_store(slot, store_len);
+            if (cold) suppressed_continued_last = -1;
+        } else if (cold) {
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
             suppressed_continued_last = -1;
@@ -14007,10 +14138,20 @@ decode_again:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
-                   max_tokens - completion >= 2 && !j->req.ignore_eos &&
-                   (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
+        } else if (s->batched_mode && (s->qwen4_batch_mtp || s->dspark_solo) &&
+                   max_tokens - completion >= 2 &&
+                   (s->dspark_solo || (!j->req.ignore_eos &&
+                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f))) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            slot->decode_max_tokens = max_tokens - completion;
+            slot->decode_eos = eos_token;
+            slot->decode_temperature = temperature;
+            slot->decode_top_k = top_k;
+            slot->decode_top_p = top_p;
+            slot->decode_min_p = min_p;
+            slot->decode_rng = &rng;
+            slot->decode_ignore_eos = j->req.ignore_eos;
+            slot->decode_think_mode = j->req.think_mode;
             if (server_eval_tokens(s, slot, token, true, toks, &ntok, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
@@ -14851,6 +14992,53 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     return SLOT_PROTECTED_SCORE_BASE - live;
 }
 
+/* Miss diagnostics: when a request reuses nothing, say for every slot that shares a long token
+ * prefix with it why the live state was not reusable - the vision gates, the exact token prefix
+ * and where the rendered text first differs, with a short escaped window of both texts. */
+static void diag_escape(char *out, size_t cap, const char *s, size_t len) {
+    size_t o = 0;
+    for (size_t i = 0; i < len && o + 5 < cap; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else if (c == '\\' || c == '\'') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c < 0x20 || c == 0x7f) o += (size_t)snprintf(out + o, cap - o, "\\x%02x", c);
+        else out[o++] = (char)c;
+    }
+    out[o] = 0;
+}
+
+static void log_reuse_miss_locked(server *s, const request *req) {
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (!slot->session || !ds4_session_checkpoint_valid(slot->session)) continue;
+        const int live_pos = ds4_session_pos(slot->session);
+        const int common = ds4_session_common_prefix(slot->session, &req->prompt);
+        if (common < 2048) continue;
+        const bool fp = ds4_session_vision_fingerprint_prefix_matches(slot->session, req->images, req->image_count);
+        const bool tip = ds4_session_vision_prefix_matches(slot->session, req->images, req->image_count);
+        const char *pt = req->prompt_text ? req->prompt_text : "";
+        const size_t plen = strlen(pt);
+        size_t d = 0;
+        char lw[200] = "", rw[200] = "";
+        if (slot->live_text) {
+            const size_t n = slot->live_text_len < plen ? slot->live_text_len : plen;
+            while (d < n && slot->live_text[d] == pt[d]) d++;
+            const size_t from = d > 48 ? d - 48 : 0;
+            const size_t lend = d + 48 < slot->live_text_len ? d + 48 : slot->live_text_len;
+            const size_t pend = d + 48 < plen ? d + 48 : plen;
+            diag_escape(lw, sizeof(lw), slot->live_text + from, lend - from);
+            diag_escape(rw, sizeof(rw), pt + from, pend - from);
+        }
+        server_log(DS4_LOG_KVCACHE,
+                   "miss diag slot %d: live=%d prompt=%d common=%d vision_fp=%d vision_tok=%d "
+                   "live_text=%zu text_pos_ok=%d text_common=%zu prompt_text=%zu thinking_live=%d "
+                   "live='%s' req='%s'",
+                   slot->id, live_pos, req->prompt.len, common, fp, tip,
+                   slot->live_text ? slot->live_text_len : 0, slot->live_text_pos == live_pos,
+                   d, plen, slot->thinking_live.valid, lw, rw);
+    }
+}
+
 static void dispatch_jobs_locked(server *s) {
     if (!s || !s->batched_mode) return;
     const time_t now = time(NULL);
@@ -14886,6 +15074,7 @@ static void dispatch_jobs_locked(server *s) {
         /* chosen_score < 0 means the request reuses nothing and is routed
          * onto a resident checkpoint, evicting it: capture what is lost so
          * the eviction is directly visible in the log. */
+        if (chosen && chosen_score < 0) log_reuse_miss_locked(s, &chosen->req);
         if (chosen && chosen_score < 0 && chosen_slot->session &&
             ds4_session_checkpoint_valid(chosen_slot->session)) {
             chosen_evict_live = ds4_session_pos(chosen_slot->session);
@@ -15436,6 +15625,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    int prefill_quantum;
     int mixed_prefill_quantum;
 } server_config;
 
@@ -15585,7 +15775,8 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
-        .mixed_prefill_quantum = 128,
+        .prefill_quantum = 8192,
+        .mixed_prefill_quantum = 4096,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -15678,6 +15869,9 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-quantum")) {
+            c.prefill_quantum =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -15947,6 +16141,10 @@ int main(int argc, char **argv) {
     s.batched_mode = cfg.batched_sessions > 0;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
+    s.dspark_solo = s.batched_mode && !s.qwen4_batch_mtp &&
+                    ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                    getenv("DS4_SERVER_DISABLE_SOLO_SPEC") == NULL;
+    s.prefill_quantum = cfg.prefill_quantum;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -16179,7 +16377,8 @@ static void test_batched_prefill_round_robin(void) {
 static void test_mixed_prefill_quantum_option(void) {
     char *default_argv[] = {"ds4-server"};
     server_config defaults = parse_options(1, default_argv);
-    TEST_ASSERT(defaults.mixed_prefill_quantum == 128);
+    TEST_ASSERT(defaults.mixed_prefill_quantum == 4096);
+    TEST_ASSERT(defaults.prefill_quantum == 8192);
 
     char *custom_argv[] = {
         "ds4-server", "--mixed-prefill-quantum", "2048"
@@ -16188,10 +16387,10 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
 
     server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
-    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
+    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 8192);
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
-    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 4096);
 }
 
 /* Reuse-aware slot routing: the probe must recognize every way a request

@@ -649,7 +649,9 @@ kernel void kernel_dsv4_hc_expand(
 // HC=4 specialization of the post/expand step. One thread computes all four
 // destination HC streams for one token/dimension, reusing the same block output
 // and residual HC values while preserving the per-stream accumulation order.
-kernel void kernel_dsv4_hc_expand4(
+// ROUND stores each stream rounded to BF16 (the V4.1 boundary).
+template <bool ROUND>
+static inline void kernel_dsv4_hc_expand4_impl(
         constant ds4_metal_args_dsv4_hc_expand & args,
         device  const char * block_out,
         device  const char * residual,
@@ -657,7 +659,7 @@ kernel void kernel_dsv4_hc_expand4(
         device  const char * comb,
         device  const char * block_add,
         device        char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint gid) {
     if (args.n_hc != 4) {
         return;
     }
@@ -688,8 +690,32 @@ kernel void kernel_dsv4_hc_expand4(
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
 
-        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = ROUND ? ds4_round_bf16(acc) : acc;
     }
+}
+
+kernel void kernel_dsv4_hc_expand4(
+        constant ds4_metal_args_dsv4_hc_expand & args,
+        device  const char * block_out,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device  const char * block_add,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    kernel_dsv4_hc_expand4_impl<false>(args, block_out, residual, post, comb, block_add, dst, gid);
+}
+
+kernel void kernel_dsv4_hc_expand4_bf16(
+        constant ds4_metal_args_dsv4_hc_expand & args,
+        device  const char * block_out,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device  const char * block_add,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    kernel_dsv4_hc_expand4_impl<true>(args, block_out, residual, post, comb, block_add, dst, gid);
 }
 
 // Decode-time FFN tail fusion:
@@ -1046,12 +1072,14 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0_vec_hc(
 
 // Reduces HC channels to a normal embedding row with the learned pre weights.
 // This is the input adapter before the attention block and before the FFN block.
-kernel void kernel_dsv4_hc_weighted_sum(
+// ROUND stores the sum rounded to BF16 (the V4.1 boundary).
+template <bool ROUND>
+static inline void kernel_dsv4_hc_weighted_sum_impl(
         constant ds4_metal_args_dsv4_hc_weighted_sum & args,
         device  const char * x,
         device  const char * weights,
         device        char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint gid) {
     const int64_t n_elem = args.n_embd * args.n_tokens;
     if ((int64_t) gid >= n_elem) {
         return;
@@ -1067,7 +1095,25 @@ kernel void kernel_dsv4_hc_weighted_sum(
         acc += xv * wv;
     }
 
-    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = ROUND ? ds4_round_bf16(acc) : acc;
+}
+
+kernel void kernel_dsv4_hc_weighted_sum(
+        constant ds4_metal_args_dsv4_hc_weighted_sum & args,
+        device  const char * x,
+        device  const char * weights,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    kernel_dsv4_hc_weighted_sum_impl<false>(args, x, weights, dst, gid);
+}
+
+kernel void kernel_dsv4_hc_weighted_sum_bf16(
+        constant ds4_metal_args_dsv4_hc_weighted_sum & args,
+        device  const char * x,
+        device  const char * weights,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    kernel_dsv4_hc_weighted_sum_impl<true>(args, x, weights, dst, gid);
 }
 
 // The one-row HC=4 output head historically materializes four device-F32
@@ -1146,7 +1192,8 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16(
     const uint n  = (uint)args.n;
     const uint n4 = n >> 2;
 
-    device const float4 *x4 = (device const float4 *)x;
+    // Grid y selects the token row (one row for decode).
+    device const float4 *x4 = (device const float4 *)(x + (uint64_t)tgpig.y*n*sizeof(float));
 
     threadgroup float *norm_shmem = (threadgroup float *)shmem;        // NW slots
     threadgroup float *mv_shmem   = (threadgroup float *)shmem + NW;   // NW*NR0 slots
@@ -1208,7 +1255,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16(
     }
 
     // n == 16384 makes the scalar tail loop of the original empty.
-    device float * dst_f32 = (device float *) dst;
+    device float * dst_f32 = (device float *) dst + (uint64_t)tgpig.y*args.out_dim;
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf_mv, r0, args.out_dim,
                                     tiisg, sgitg, (threadgroup char *)mv_shmem);
 }
@@ -1239,7 +1286,8 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2(
 
     const uint n = (uint)args.n;
     const uint n4 = n >> 2;
-    device const float4 *x4 = (device const float4 *)x;
+    // Grid y selects the token row (one row for decode).
+    device const float4 *x4 = (device const float4 *)(x + (uint64_t)tgpig.y*n*sizeof(float));
     threadgroup float *norm_shmem = (threadgroup float *)shmem;
     threadgroup float *mv_shmem = norm_shmem + NW;
 
@@ -1312,7 +1360,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device float *mixes_f32 = (device float *)dst;
+    device float *mixes_f32 = (device float *)dst + (uint64_t)tgpig.y*args.out_dim;
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         const float tot = simd_sum(cluster_shmem[row][tiisg]);
         if (tiisg == 0 && local_sg == 0 && r0 + row < args.out_dim) {

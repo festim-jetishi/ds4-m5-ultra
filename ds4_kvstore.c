@@ -178,6 +178,9 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "evict")) return DS4_KVSTORE_REASON_EVICT;
     if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
     if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
+    /* Server prefixes shared by agent sessions in different folders. */
+    if (!strcmp(reason, "tools") || !strcmp(reason, "shared"))
+        return DS4_KVSTORE_REASON_AGENT_SYSTEM;
     if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
     return DS4_KVSTORE_REASON_UNKNOWN;
 }
@@ -532,7 +535,8 @@ static bool kv_cache_incoming_supersedes_continued(
 static bool kv_cache_reason_is_anchor(uint8_t reason) {
     return reason == DS4_KVSTORE_REASON_COLD ||
            reason == DS4_KVSTORE_REASON_EVICT ||
-           reason == DS4_KVSTORE_REASON_SHUTDOWN;
+           reason == DS4_KVSTORE_REASON_SHUTDOWN ||
+           reason == DS4_KVSTORE_REASON_AGENT_SYSTEM;
 }
 
 double ds4_kvstore_entry_eviction_score(
@@ -1214,6 +1218,40 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         char sha[41];
         ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
         if (!strcmp(sha, e->sha)) best = i;
+    }
+    return best;
+}
+
+/* Longest byte prefix that prompt_text shares with any cached checkpoint's
+ * text, whether or not that checkpoint is usable for this prompt. */
+size_t ds4_kvstore_longest_shared_text(ds4_kvstore *kc, const char *prompt_text,
+                                       int model_id) {
+    if (!kc->enabled || !prompt_text) return 0;
+    kv_cache_refresh(kc);
+    const size_t prompt_bytes = strlen(prompt_text);
+    size_t best = 0;
+    char buf[65536];
+    for (int i = 0; i < kc->len; i++) {
+        const ds4_kvstore_entry *e = &kc->entry[i];
+        if (e->model_id != (uint8_t)model_id) continue;
+        FILE *fp = fopen(e->path, "rb");
+        if (!fp) continue;
+        ds4_kvstore_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        if (ds4_kvstore_read_header(fp, &hdr, &text_bytes)) {
+            const size_t n = text_bytes < prompt_bytes ? text_bytes : prompt_bytes;
+            size_t same = 0;
+            while (same < n) {
+                const size_t want = n - same < sizeof(buf) ? n - same : sizeof(buf);
+                if (fread(buf, 1, want, fp) != want) break;
+                size_t k = 0;
+                while (k < want && buf[k] == prompt_text[same + k]) k++;
+                same += k;
+                if (k < want) break;
+            }
+            if (same > best) best = same;
+        }
+        fclose(fp);
     }
     return best;
 }

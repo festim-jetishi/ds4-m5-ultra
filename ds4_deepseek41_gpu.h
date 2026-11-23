@@ -75,6 +75,14 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
 /* Compressed pairs advance two absolute token positions per stored row. */
+int ds4_gpu_dsv41_parallel_ffn_start(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *shared_out, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t model_dim, uint32_t shared_dim, const ds4_gpu_tensor *x, float clamp);
+int ds4_gpu_dsv41_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                           uint32_t rows, const uint32_t *positions,
+                           bool compressed, bool inverse);
 int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,
                              bool compressed, bool inverse);
@@ -136,6 +144,71 @@ int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t row_offset,
                             ds4_gpu_tensor *plain, uint32_t width, uint32_t rows,
                             uint32_t format, bool pack);
 /* Batched F16 projections with the same arithmetic as individual matvecs. */
+int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                           uint32_t rows, uint32_t start, bool compressed, bool inverse);
+int ds4_gpu_dsv41_bf16_rope_rows(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                                uint32_t rows, const uint32_t *positions,
+                                bool compressed, bool inverse);
+int ds4_gpu_dsv41_argmax_tensor(ds4_gpu_tensor *out, uint32_t slot,
+                                const ds4_gpu_tensor *x, uint32_t n);
+int ds4_gpu_dsv41_markov_embed_tensor(ds4_gpu_tensor *embed, ds4_gpu_tensor *conf_in,
+                                      uint64_t conf_offset, const void *model_map,
+                                      uint64_t model_size, uint64_t w1_offset, uint32_t rank,
+                                      uint32_t vocab, const ds4_gpu_tensor *tokens,
+                                      uint32_t slot, int32_t token);
+int ds4_gpu_dsv41_add_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+                                 const ds4_gpu_tensor *b, uint32_t n);
+int ds4_gpu_dsv41_attention_low_bf16_tensor(ds4_gpu_tensor *low, const void *model_map,
+                                           uint64_t model_size, uint64_t out_a_offset,
+                                           const ds4_gpu_tensor *heads, uint32_t n_tokens);
+int ds4_gpu_rms_norm_weight_rows_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                                             const void *model_map, uint64_t model_size,
+                                             uint64_t weight_offset, uint32_t n,
+                                             uint32_t rows, float eps);
+int ds4_gpu_hc_weighted_sum_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc,
+                                        const ds4_gpu_tensor *weights, uint32_t n_embd,
+                                        uint32_t n_hc, bool split);
+int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+                                        const ds4_gpu_tensor *residual_hc,
+                                        const ds4_gpu_tensor *split, uint32_t n_embd,
+                                        uint32_t n_hc);
+int ds4_gpu_dsv41_attention_decode_heads_bf16_rope(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        const ds4_gpu_tensor *comp_kv, uint32_t n_comp, uint32_t n_head, uint32_t head_dim,
+        uint32_t pos, bool compressed);
+int ds4_gpu_dsv41_attention_rows_heads_bf16_rope(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, uint32_t n_rows, uint32_t n_keys,
+        uint32_t n_head, uint32_t head_dim, const uint32_t *positions, bool compressed,
+        const uint32_t *row_keys);
+int ds4_gpu_dsv41_ragged_rows_ok(uint32_t n_keys);
+int ds4_gpu_dsv41_attention_output_batch_bf16(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens);
+int ds4_gpu_dsv41_stage_rows_tensor(
+        uint32_t n_rows, uint32_t n_keys,
+        ds4_gpu_tensor *const *windows, ds4_gpu_tensor *const *comps,
+        const ds4_gpu_tensor *kv_rows, const ds4_gpu_tensor *sel, uint32_t sel_stride,
+        const uint32_t *n_raw, const uint32_t *first_pos, const uint32_t *new_from,
+        const uint32_t *new_row0, const uint32_t *n_comp);
+int ds4_gpu_attention_rows_stage_tensor(uint32_t row, uint32_t n_rows,
+                                        const ds4_gpu_tensor *raw_kv, uint32_t n_raw,
+                                        uint32_t raw_cap, uint32_t raw_start,
+                                        const ds4_gpu_tensor *comp_kv, uint32_t n_comp,
+                                        uint32_t head_dim);
+int ds4_gpu_attention_rows_heads_tensor(ds4_gpu_tensor *heads, const void *model_map,
+                                        uint64_t model_size, uint64_t sinks_offset,
+                                        const ds4_gpu_tensor *q, uint32_t n_rows,
+                                        uint32_t n_keys, uint32_t n_head, uint32_t head_dim);
+int ds4_gpu_dsv41_projection_rows_strided(ds4_gpu_tensor *out, uint32_t out_stride,
+                                         const void *model_map, uint64_t model_size,
+                                         uint64_t weight_offset, uint32_t width,
+                                         uint32_t outputs, uint32_t rows,
+                                         const ds4_gpu_tensor *in, uint32_t in_stride);
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const void *model_map, uint64_t model_size,
                                  uint64_t weight_offset, uint32_t width,

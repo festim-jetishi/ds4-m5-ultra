@@ -148,6 +148,99 @@ kernel void kernel_argsort_f32_i32(
 
 // Host-visible sort variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
+
+struct ds4_metal_args_dsv41_router {
+    uint32_t n_expert;
+    uint32_t n_used;
+    uint32_t has_bias;
+    float    scale;
+};
+
+// V4.1 router selection, one threadgroup per token row: the generic path's
+// softplus, sqrt, bias add, argsort top-k, weight gather, row sum, clamp,
+// divide and scale (nine dispatches) with each step's arithmetic unchanged.
+// Every intermediate the generic path stores goes through memory here too
+// (device stores reloaded as volatile, a volatile threadgroup slot for the
+// quotient), the sort is the same bitonic network over the same padded width
+// (one thread per slot, ntg = next power of two), and the six-weight sum runs
+// on six active lanes like the six-thread row-sum dispatch.
+kernel void kernel_dsv41_router_select(
+        constant ds4_metal_args_dsv41_router & args,
+        device const float * logits,
+        device       float * probs,
+        device const float * bias,
+        device     int32_t * selected,
+        device       float * weights,
+        threadgroup int32_t * shmem_i32 [[threadgroup(0)]],
+        uint   row [[threadgroup_position_in_grid]],
+        ushort col [[thread_position_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    const int width = (int)args.n_expert;
+    device const float * lrow = logits + (uint64_t)row*width;
+    device       float * prow = probs  + (uint64_t)row*width;
+    device volatile float * vprow = (device volatile float *) prow;
+    threadgroup float * shmem_f32 = (threadgroup float *) (shmem_i32 + ntg);
+    threadgroup volatile float * quot = (threadgroup volatile float *) (shmem_f32 + ntg);
+
+    // kernel_unary_f32_f32_4 softplus, stored; then sqrt of the stored value,
+    // stored (float4 lanes, as those dispatches run them).
+    device volatile float4 * vprow4 = (device volatile float4 *) prow;
+    if (col < width/4) {
+        const float4 x = ((device const float4 *) lrow)[col];
+        const float4 ex = exp(x);
+        const float4 em = min(ex, (float4)0.03125f);
+        const float4 poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        vprow4[col] = select(select(log(1 + ex), poly, ex < (float4)0.03125f), x, x > 20);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (col < width/4) {
+        const float4 sp = vprow4[col];
+        vprow4[col] = sqrt(sp);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Bias add (stored score), then kernel_argsort_f32_i32's network.
+    shmem_i32[col] = col;
+    if (col < width) {
+        const float p = vprow[col];
+        shmem_f32[col] = args.has_bias ? p + bias[col] : p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 2; k <= ntg; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (shmem_i32[col] >= width ||
+                       (shmem_i32[ixj] <  width &&
+                            shmem_f32[shmem_i32[col]] < shmem_f32[shmem_i32[ixj]])) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                } else {
+                    if (shmem_i32[ixj] >= width ||
+                       (shmem_i32[col] <  width &&
+                            shmem_f32[shmem_i32[col]] > shmem_f32[shmem_i32[ixj]])) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Gather, six-lane row sum, clamp, divide, scale.
+    if (col < args.n_used) {
+        const int32_t e = shmem_i32[col];
+        selected[(uint64_t)row*args.n_used + col] = e;
+        const float w = vprow[e];
+        float s = simd_sum(w);
+        s = simd_sum(col == 0 ? s : 0.0f);
+        s = clamp(s, 6.103515625e-5f, INFINITY);
+        quot[col] = w / s;
+        weights[(uint64_t)row*args.n_used + col] = quot[col] * args.scale;
+    }
+}
 template [[host_name("kernel_argsort_f32_i32_desc_causal")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
 

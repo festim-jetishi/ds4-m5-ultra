@@ -19,6 +19,10 @@ struct ds41_dspark {
     ds4_gpu_tensor *verify_residual, *verify_pre, *verify_logits, *verify_pool;
     ds4_gpu_tensor *old_raw, *old_features;
     uint32_t old_positions[3][DS41_VERIFY_ROWS];
+    /* Rollback rows saved during drafting (for a verify at saved_start). */
+    uint32_t saved_start;
+    bool saved;
+    ds4_gpu_tensor *chain_tokens, *chain_conf;
     ds41_gpu_graph verified[DS41_VERIFY_ROWS + 1u];
     float *host_verified;
     uint32_t verify_start, verify_count, rewind_end;
@@ -31,6 +35,7 @@ static void ds41_dspark_reset(ds41_dspark *d) {
     d->kv_end = 0;
     d->verify_count = 0;
     d->rewind_end = 0;
+    d->saved = false;
 }
 
 static void ds41_dspark_free(ds41_dspark *d) {
@@ -62,6 +67,7 @@ static void ds41_dspark_free(ds41_dspark *d) {
     ds4_gpu_tensor_free(d->verify_residual); ds4_gpu_tensor_free(d->verify_pre);
     ds4_gpu_tensor_free(d->verify_logits); ds4_gpu_tensor_free(d->verify_pool);
     ds4_gpu_tensor_free(d->old_raw); ds4_gpu_tensor_free(d->old_features);
+    ds4_gpu_tensor_free(d->chain_tokens); ds4_gpu_tensor_free(d->chain_conf);
     free(d->host_verified);
     free(d->host_logits);
     free(d->draft_probs);
@@ -104,6 +110,8 @@ static DS4_MAYBE_UNUSED ds41_dspark *ds41_dspark_alloc(const ds4_dspark_weights 
     DS41_DRAFT_A(verify_pool, (DS41_VERIFY_ROWS + 1u) * 8u * DS4_N_HEAD_DIM)
     DS41_DRAFT_A(old_raw, 40u * DS41_VERIFY_ROWS * DS4_N_HEAD_DIM)
     DS41_DRAFT_A(old_features, 3u * DS41_VERIFY_ROWS * DS4_N_EMBD)
+    DS41_DRAFT_A(chain_tokens, DS41_VERIFY_ROWS)
+    DS41_DRAFT_A(chain_conf, DS41_DRAFT_ROWS)
 #undef DS41_DRAFT_A
     d->host_logits = malloc((uint64_t)DS41_DRAFT_ROWS * DS4_N_VOCAB * sizeof(float));
     d->draft_probs = malloc((uint64_t)DS41_DRAFT_ROWS * DS4_N_VOCAB * sizeof(float));
@@ -122,6 +130,7 @@ static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows) {
     if (!d) return true;
     d->rewind_end = 0;
+    d->saved = false;
     unsigned stage = 0;
     while (stage < 3 && d->weights->target_layers[stage] != layer) stage++;
     if (stage == 3) return true;
@@ -202,6 +211,29 @@ static bool ds41_dspark_attention_output(ds41_prefill_row *b, const ds4_model *m
     const uint32_t groups = DS4_N_OUT_GROUP, width = DS4_N_HEAD * DS4_N_HEAD_DIM / groups;
     uint64_t weight_row;
     if (!tensor_nbytes(l->attn_output_a->type, width, &weight_row)) return false;
+#ifdef __APPLE__
+    /* One dispatch per group for all draft rows: each group's weights are read
+     * once rather than once per row, and the BF16 pass runs once at the end. */
+    if (l->attn_output_a->type == DS4_TENSOR_F16 &&
+        !getenv("DS4_METAL_DISABLE_V41_DRAFT_GROUP_ROWS")) {
+        const uint64_t heads_bytes = (uint64_t)DS41_DRAFT_ROWS * groups * width * 4u;
+        const uint64_t low_bytes = (uint64_t)DS41_DRAFT_ROWS * groups * DS4_N_LORA_O * 4u;
+        bool ok = true;
+        for (uint32_t group = 0; ok && group < groups; group++) {
+            ds4_gpu_tensor *x = ds4_gpu_tensor_view(b->heads, (uint64_t)group * width * 4u,
+                heads_bytes - (uint64_t)group * width * 4u);
+            ds4_gpu_tensor *y = ds4_gpu_tensor_view(b->low, (uint64_t)group * DS4_N_LORA_O * 4u,
+                low_bytes - (uint64_t)group * DS4_N_LORA_O * 4u);
+            ok = x && y && ds4_gpu_dsv41_projection_rows_strided(y, groups * DS4_N_LORA_O,
+                m->map, m->size, l->attn_output_a->abs_offset + group * DS4_N_LORA_O * weight_row,
+                width, DS4_N_LORA_O, DS41_DRAFT_ROWS, x, groups * width);
+            ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(x);
+        }
+        return ok && ds4_gpu_dsv41_quantize(b->low, groups * DS4_N_LORA_O, DS41_DRAFT_ROWS,
+                                            DS4_V41_BF16) &&
+            ds41_dspark_matmul_batch(b->block, m, l->attn_output_b, b->low, DS41_DRAFT_ROWS, true);
+    }
+#endif
     for (uint32_t row = 0; row < DS41_DRAFT_ROWS; row++) {
         for (uint32_t group = 0; group < groups; group++) {
             ds4_tensor slice = *l->attn_output_a;
@@ -281,6 +313,68 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
         ds4_gpu_dsv41_quantize(b->residual, DS4_N_HC * DS4_N_EMBD, n, DS4_V41_BF16);
 }
 
+/* The verify rollback copies for every row a verify at g->pos can use: the
+ * target raw-window slots and drafter feature slots it will overwrite. Neither
+ * changes between drafting and verifying, so saving them while the drafter runs
+ * equals saving them at verify time. Independent copies, one concurrent run. */
+static bool ds41_dspark_save_rows(ds41_dspark *d, ds41_gpu_graph *g) {
+    const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
+    const bool section = ds41_concurrent() && ds4_gpu_concurrent_begin();
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < DS41_VERIFY_ROWS; i++) {
+        const uint32_t slot = (g->pos + i) % DS41_DRAFT_WINDOW;
+        for (uint32_t il = 0; ok && il < 40; il++)
+            ok = ds4_gpu_tensor_copy(d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv,
+                g->window[il], slot * kv, kv);
+        for (uint32_t stage = 0; ok && stage < 3; stage++) {
+            d->old_positions[stage][i] = d->positions[stage][slot];
+            ok = ds4_gpu_tensor_copy(d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature,
+                d->target[stage], slot * feature, feature);
+        }
+    }
+    if (section) ds4_gpu_concurrent_end();
+    d->saved = ok;
+    d->saved_start = g->pos;
+    return ok;
+}
+
+/* Greedy Markov drafts on the GPU in one command batch: row r takes the
+ * argmax of row r-1 (first_token for row 0) through markov_w1, adds the Markov
+ * bias to its logits row and computes its confidence, exactly as
+ * ds41_dspark_markov, and the argmax picks row r's token. tokens[r] and
+ * confidence[r] for r < rows. Returns -1 (nothing done) when unsupported. */
+static DS4_MAYBE_UNUSED int ds41_dspark_markov_chain(ds41_dspark *d, const ds4_model *m,
+        uint32_t rows, int first_token, int *tokens, float *confidence) {
+    const ds4_dspark_stage_weights *last = &d->weights->stage[2];
+    const uint32_t rank = d->weights->markov_rank;
+    if (getenv("DS4_DSPARK_DISABLE_V41_GPU_MARKOV") || rows == 0 || rows > DS41_DRAFT_ROWS ||
+        rank != 256 || last->markov_w1->type != DS4_TENSOR_F32 || first_token < 0 ||
+        (uint32_t)first_token >= DS4_N_VOCAB) return -1;
+    const uint64_t bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    bool ok = ds4_gpu_begin_commands();
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        ds4_gpu_tensor *logits = ds4_gpu_tensor_view(d->logits, row * bytes, bytes);
+        ok = logits &&
+            ds4_gpu_dsv41_markov_embed_tensor(d->markov_embed, d->confidence_input,
+                (uint64_t)DS4_N_EMBD * 4u, m->map, m->size, last->markov_w1->abs_offset,
+                rank, DS4_N_VOCAB, row ? d->chain_tokens : NULL, row, first_token) &&
+            ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
+            ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB) &&
+            ds4_gpu_tensor_copy(d->confidence_input, 0, d->batch.x,
+                (uint64_t)row * DS4_N_EMBD * 4u, (uint64_t)DS4_N_EMBD * 4u) &&
+            ds41_matmul(d->confidence, m, last->confidence_proj, d->confidence_input, false) &&
+            ds4_gpu_tensor_copy(d->chain_conf, row * 4u, d->confidence, 0, 4u) &&
+            ds4_gpu_dsv41_argmax_tensor(d->chain_tokens, row + 1u, logits, DS4_N_VOCAB);
+        ds4_gpu_tensor_free(logits);
+    }
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    int32_t ids[DS41_VERIFY_ROWS];
+    if (ok) ok = ds4_gpu_tensor_read(d->chain_tokens, 4u, ids + 1, rows * 4u) &&
+        ds4_gpu_tensor_read(d->chain_conf, 0, confidence, rows * sizeof(float));
+    if (ok) for (uint32_t row = 0; row < rows; row++) tokens[row] = ids[row + 1];
+    return ok ? 1 : 0;
+}
+
 /* Leaves the five base-logit rows and unnormalized collapsed features on the
  * GPU. Markov sampling is sequential and performed after this stage chain. */
 static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model *target,
@@ -302,8 +396,10 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
             DS4_N_EMBD, DS4_N_HC);
         ds4_gpu_tensor_free(out);
     }
+    const bool pipelined = !local_experts && !getenv("DS4_DSPARK_DISABLE_V41_DRAFT_PIPELINE");
     for (uint32_t stage = 0; ok && stage < 3; stage++) {
-        ok = ds41_dspark_stage(d, draft, stage, pos);
+        if (pipelined && !ds4_gpu_flush_commands()) ok = false;
+        ok = ok && ds41_dspark_stage(d, draft, stage, pos);
         if (!ok) fprintf(stderr, "ds4: V4.1 DSpark stage %u failed\n", stage);
     }
     if (ok) ok = ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual,
@@ -313,6 +409,9 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
     if (ok) ok = target_graph ?
         ds41_output_projection(target_graph, d->logits, target, tw, b->norm, DS41_DRAFT_ROWS) :
         ds41_matmul_batch(d->logits, target, tw->output, b->norm, DS41_DRAFT_ROWS, false);
+    d->saved = false;
+    if (ok && pipelined && target_graph && ds4_gpu_flush_commands())
+        ok = ds41_dspark_save_rows(d, target_graph);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (local_experts) ds4_gpu_tp_suspend_expert_sharding(0);
     if (!ok) d->kv_valid = false;
@@ -346,33 +445,26 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
     return ok;
 }
 
-/* Cache appends beyond the accepted frontier are invisible. Only the six
- * overwritten raw-ring slots and pooling carries need rollback; no compressed
- * cache proportional to the context is copied. */
-static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
-        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
-    if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
-        g->pos > g->ctx || count > g->ctx - g->pos || !ds41_tp_batch_enabled(g)) return false;
-    /* Prepost the complete small-row exchange window, as in V4.0 verification.
-     * Bulk-prefill handshakes at every attention/FFN gate are too expensive. */
-    const bool tp_block = g->tp_world == 2;
-    uint32_t gates = 2;
-    if (tp_block && (!g->tp_batch_out || !g->tp_batch_in || !g_tp_block_ctx ||
-        !ds4_tp_batch_block_begin_gates(g_tp_block_ctx, count, DS4_N_LAYER, &gates) ||
-        gates != 2)) return false;
+/* Snapshots and verify row graphs for count rows (1 to DS41_VERIFY_ROWS) at
+ * g->pos, encoded into the active command batch; graphs[i] receives row i. */
+static bool ds41_dspark_verify_prepare(ds41_dspark *d, ds41_gpu_graph *g, uint32_t count,
+                                       ds41_gpu_graph **graphs) {
+    if (!d || !g->valid || count < 1 || count > DS41_VERIFY_ROWS ||
+        g->pos > g->ctx || count > g->ctx - g->pos) return false;
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
-    ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
-    bool ok = ds4_gpu_begin_commands();
+    bool ok = true;
     d->verify_start = g->pos;
     d->verify_count = 0;
     d->rewind_end = 0;
+    const bool saved = d->saved && d->saved_start == g->pos;
+    d->saved = false;
     for (uint32_t i = 0; ok && i <= DS41_VERIFY_ROWS; i++) {
         if (i >= count && i != DS41_VERIFY_ROWS) continue;
         const uint32_t slot = (g->pos + i) % DS41_DRAFT_WINDOW;
-        for (uint32_t il = 0; ok && i < count && il < 40; il++)
+        for (uint32_t il = 0; ok && !saved && i < count && il < 40; il++)
             ok = ds4_gpu_tensor_copy(d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv,
                 g->window[il], slot * kv, kv);
-        for (uint32_t stage = 0; ok && i < count && stage < 3; stage++) {
+        for (uint32_t stage = 0; ok && !saved && i < count && stage < 3; stage++) {
             d->old_positions[stage][i] = d->positions[stage][slot];
             ok = ds4_gpu_tensor_copy(d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature,
                 d->target[stage], slot * feature, feature);
@@ -417,12 +509,12 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
                     ds4_gpu_tensor_copy(row->verify_previous_score[owner], 0, g->previous_score[owner], 0, kv);
         }
     }
-    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
-    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
-    if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
-        ds4_tp_mark_failed(g_tp_block_ctx);
-        ok = false;
-    }
+    return ok;
+}
+
+/* After the verify step's command batch completed: the rows' logits (and the
+ * block start's) on the host. */
+static bool ds41_dspark_verify_finish(ds41_dspark *d, ds41_gpu_graph *g, uint32_t count, bool ok) {
     if (ok) ok = ds4_gpu_tensor_read(d->verify_logits, 0, d->host_verified,
         (uint64_t)count * DS4_N_VOCAB * 4u) &&
         ds4_gpu_tensor_read(d->verify_logits, (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB * 4u,
@@ -430,6 +522,31 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
     if (ok) d->verify_count = count;
     else g->valid = false;
     return ok;
+}
+
+/* Cache appends beyond the accepted frontier are invisible. Only the six
+ * overwritten raw-ring slots and pooling carries need rollback; no compressed
+ * cache proportional to the context is copied. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
+        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
+    if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
+        g->pos > g->ctx || count > g->ctx - g->pos || !ds41_tp_batch_enabled(g)) return false;
+    /* Prepost the complete small-row exchange window, as in V4.0 verification.
+     * Bulk-prefill handshakes at every attention/FFN gate are too expensive. */
+    const bool tp_block = g->tp_world == 2;
+    uint32_t gates = 2;
+    if (tp_block && (!g->tp_batch_out || !g->tp_batch_in || !g_tp_block_ctx ||
+        !ds4_tp_batch_block_begin_gates(g_tp_block_ctx, count, DS4_N_LAYER, &gates) ||
+        gates != 2)) return false;
+    ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
+    bool ok = ds4_gpu_begin_commands() && ds41_dspark_verify_prepare(d, g, count, graphs);
+    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
+        ds4_tp_mark_failed(g_tp_block_ctx);
+        ok = false;
+    }
+    return ds41_dspark_verify_finish(d, g, count, ok);
 }
 
 static DS4_MAYBE_UNUSED bool ds41_dspark_commit(ds41_dspark *d, ds41_gpu_graph *g,

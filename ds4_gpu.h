@@ -164,6 +164,10 @@ int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
+int ds4_gpu_concurrent_begin(void);
+void ds4_gpu_concurrent_barrier(void);
+void ds4_gpu_concurrent_serial(int on);
+void ds4_gpu_concurrent_end(void);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
@@ -178,6 +182,8 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+/* Wait for command buffers already committed; an open batch stays open. */
+int ds4_gpu_wait_committed(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -853,6 +859,18 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+
+/* As above with every output rounded to BF16 (one dispatch, same values as a
+ * separate DS4 V4.1 BF16 pass). One row is the plain decode matvec. */
+int ds4_gpu_matmul_q8_0_decode_rows_exact_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -1148,6 +1166,17 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* Several rows in one dispatch, each bit-identical to a one-row call. */
+int ds4_gpu_matmul_f32_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows);
 
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
@@ -3030,6 +3059,16 @@ int ds4_gpu_hc_pre_f32_mix_split_norm_tensor(
 #endif
 
 int ds4_gpu_hc_rms_norm_mix_f16_available(void);
+int ds4_gpu_hc_rms_norm_mix_f16_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n,
+        uint32_t              out_dim,
+        uint32_t              rows,
+        float                 eps);
 int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,

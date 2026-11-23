@@ -556,6 +556,17 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
                                                int (*accepted)[2], int *n_accepted,
                                                char *err, size_t errlen);
+/* One DSpark speculative cycle for several sessions whose drafts are verified
+ * in one batch (DeepSeek V4.1 with --dspark): each item feeds its token, then
+ * commits the drafts that match the target's greedy choice, as
+ * ds4_session_eval_speculative does without exact sampling. accepted[i] and
+ * n_accepted[i] list what item i committed. Engines or sessions that cannot
+ * run it advance one token each (ds4_sessions_eval_batch). Nonzero on
+ * failure, after which every session must be rebuilt. */
+int ds4_sessions_eval_batch_dspark(ds4_decode_item *items, int count,
+        const int *max_tokens, const int *eos_tokens, const bool *ignore_eos,
+        const ds4_think_mode *think_modes, int (*accepted)[17], int *n_accepted,
+        char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */

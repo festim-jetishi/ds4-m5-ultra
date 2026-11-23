@@ -2015,6 +2015,53 @@ kernel void kernel_glm_indexer_score_one_direct(
     }
 }
 
+// Same scores as kernel_glm_indexer_score_one_direct (per key: the head
+// dot products, SIMD sums, ReLU-scaled weights and the head-ordered sum),
+// but the query is staged once per threadgroup and each SIMD group scores
+// its own keys, so long caches no longer reread the query for every key.
+kernel void kernel_glm_indexer_score_one_simd(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint KEYS_PER_SG = 16u;
+    threadgroup float4 *qtg = (threadgroup float4 *) shared;
+    volatile threadgroup float *slot = shared + 32u * 128u + sg;
+    device const float4 *q4 = (device const float4 *) q;
+    for (uint i = tid; i < 32u * 32u; i += 128u) qtg[i] = q4[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    const uint first = (group * 4u + (uint)sg) * KEYS_PER_SG;
+    for (uint k = 0; k < KEYS_PER_SG; ++k) {
+        const uint row = first + k;
+        if (row >= args.n_rows) break;
+        float4 kv;
+        for (uint j = 0; j < 4u; ++j) {
+            kv[j] = glm_cache_load_f32_or_f16(indexer_key_cache,
+                (uint64_t)row * 128u + lane * 4u + j, args.cache_f16);
+        }
+        float acc = 0.0f;
+        for (uint head = 0; head < 32u; ++head) {
+            float s = dot(qtg[head * 32u + lane], kv);
+            s = simd_sum(s);
+            if (lane == 0) {
+                // Round the term before the sum, as the original's shared
+                // memory hand-off does (no fused multiply-add).
+                *slot = max(s * args.scale, 0.0f) * weights[head];
+                acc += *slot;
+            }
+        }
+        if (lane == 0) scores[row] = acc;
+    }
+}
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
