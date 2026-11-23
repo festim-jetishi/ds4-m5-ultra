@@ -37276,7 +37276,7 @@ int ds4_gpu_glm_indexer_score_one_tensor(
 
         static int rows4_env = -1;
         if (rows4_env < 0) rows4_env = getenv("DS4_METAL_DISABLE_V41_SCORE_ROWS4") == NULL;
-        if (n_head == 32u && head_dim == 128u && rows4_env) {
+        if (n_head == 32u && head_dim == 128u && rows4_env && n_rows > 4096u) {
             id<MTLComputePipelineState> rows4_pipeline = g_glm_indexer_score_one_rows4_pipeline;
             if (!rows4_pipeline) {
                 rows4_pipeline = ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_rows4");
