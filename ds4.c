@@ -41259,6 +41259,15 @@ static struct {
     const ds4_model *dspark_owner;
     ds4_gpu_tensor *markov_w2;
     bool markov_failed;
+    const ds4_model *draft_prune_target;
+    const ds4_model *draft_prune_draft;
+    bool draft_prune_failed;
+    uint32_t draft_vocab;
+    uint32_t *draft_local_to_full;
+    int32_t *draft_full_to_local;
+    ds4_gpu_tensor *draft_output_q8;
+    ds4_gpu_tensor *draft_markov_w2;
+    ds4_gpu_tensor *draft_markov_w1;
 } g_ds41_bf16_narrow;
 
 static void ds41_narrow_free(void) {
@@ -41276,6 +41285,11 @@ static void ds41_narrow_free(void) {
         ds4_gpu_tensor_free(g_ds41_bf16_narrow.engram_scales[i]);
     }
     ds4_gpu_tensor_free(g_ds41_bf16_narrow.markov_w2);
+    ds4_gpu_tensor_free(g_ds41_bf16_narrow.draft_output_q8);
+    ds4_gpu_tensor_free(g_ds41_bf16_narrow.draft_markov_w2);
+    ds4_gpu_tensor_free(g_ds41_bf16_narrow.draft_markov_w1);
+    free(g_ds41_bf16_narrow.draft_local_to_full);
+    free(g_ds41_bf16_narrow.draft_full_to_local);
     memset(&g_ds41_bf16_narrow, 0, sizeof(g_ds41_bf16_narrow));
 }
 
@@ -41306,7 +41320,7 @@ static void ds41_narrow_own(const ds4_model *m) {
 }
 
 static void ds41_narrow_update_residency(void) {
-    ds4_gpu_tensor *all[64u * 3u + 5u];
+    ds4_gpu_tensor *all[64u * 3u + 8u];
     uint32_t n_all = 0;
     for (uint32_t il = 0; il < 64u; il++) {
         if (g_ds41_bf16_narrow.router[il]) all[n_all++] = g_ds41_bf16_narrow.router[il];
@@ -41322,6 +41336,9 @@ static void ds41_narrow_update_residency(void) {
         }
     }
     if (g_ds41_bf16_narrow.markov_w2) all[n_all++] = g_ds41_bf16_narrow.markov_w2;
+    if (g_ds41_bf16_narrow.draft_output_q8) all[n_all++] = g_ds41_bf16_narrow.draft_output_q8;
+    if (g_ds41_bf16_narrow.draft_markov_w2) all[n_all++] = g_ds41_bf16_narrow.draft_markov_w2;
+    if (g_ds41_bf16_narrow.draft_markov_w1) all[n_all++] = g_ds41_bf16_narrow.draft_markov_w1;
     if (n_all) {
         (void)ds4_gpu_weight_residency(all, n_all);
         g_ds41_bf16_narrow.resident = true;
@@ -41375,6 +41392,189 @@ static ds4_gpu_tensor *ds41_markov_w2_bf16(const ds4_model *m, const ds4_tensor 
         }
     }
     return g_ds41_bf16_narrow.markov_w2;
+}
+
+/* Decode GPT-2 byte-level BPE piece into raw UTF-8 bytes and verify all Unicode
+ * codepoints fall inside allowed script ranges (ASCII, Latin-1/Ext-A/B, Greek math,
+ * punctuation/math/arrows). Returns true if token should be kept in pruned draft vocab. */
+static bool ds41_draft_token_keep(uint32_t id, const char *s, size_t len, int mode) {
+    /* mode: 1=latin (all), 2=ascii (all), 3=latin98k, 4=latin65k */
+    if (id < 256u) return true;
+    if (id >= 128799u) {
+        if (len >= 12 && (strstr(s, "place_holder") || strstr(s, "reserved"))) return false;
+        return true;
+    }
+    if (mode == 3 && id >= 98304u) return false;
+    if (mode == 4 && id >= 65536u) return false;
+    if (len == 0 || len > 128) return false;
+
+    static uint8_t u2b_init = 0;
+    static int16_t u2b[512];
+    if (!u2b_init) {
+        for (int i = 0; i < 512; i++) u2b[i] = -1;
+        uint8_t is_direct[256] = {0};
+        for (int b = 33; b <= 126; b++) { is_direct[b] = 1; u2b[b] = (int16_t)b; }
+        for (int b = 161; b <= 172; b++) { is_direct[b] = 1; u2b[b] = (int16_t)b; }
+        for (int b = 174; b <= 255; b++) { is_direct[b] = 1; u2b[b] = (int16_t)b; }
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            if (!is_direct[b]) u2b[256 + n++] = (int16_t)b;
+        }
+        u2b_init = 1;
+    }
+    uint8_t raw[256];
+    size_t rlen = 0;
+    size_t pos = 0;
+    while (pos < len) {
+        uint8_t c0 = (uint8_t)s[pos];
+        uint32_t cp = 0;
+        if (c0 < 0x80u) { cp = c0; pos += 1; }
+        else if ((c0 & 0xE0u) == 0xC0u && pos + 1 < len) {
+            cp = ((uint32_t)(c0 & 0x1Fu) << 6) | ((uint32_t)(uint8_t)s[pos + 1] & 0x3Fu);
+            pos += 2;
+        } else {
+            return false;
+        }
+        if (cp >= 512u || u2b[cp] < 0 || rlen >= sizeof(raw)) return false;
+        raw[rlen++] = (uint8_t)u2b[cp];
+    }
+    pos = 0;
+    while (pos < rlen) {
+        uint8_t b0 = raw[pos];
+        uint32_t cp = 0;
+        if (b0 < 0x80u) { cp = b0; pos += 1; }
+        else if ((b0 & 0xE0u) == 0xC0u && pos + 1 < rlen && (raw[pos + 1] & 0xC0u) == 0x80u) {
+            cp = ((uint32_t)(b0 & 0x1Fu) << 6) | (uint32_t)(raw[pos + 1] & 0x3Fu);
+            pos += 2;
+        } else if ((b0 & 0xF0u) == 0xE0u && pos + 2 < rlen &&
+                   (raw[pos + 1] & 0xC0u) == 0x80u && (raw[pos + 2] & 0xC0u) == 0x80u) {
+            cp = ((uint32_t)(b0 & 0x0Fu) << 12) | ((uint32_t)(raw[pos + 1] & 0x3Fu) << 6) |
+                 (uint32_t)(raw[pos + 2] & 0x3Fu);
+            pos += 3;
+        } else {
+            return false;
+        }
+        if (mode == 2) {
+            if (cp >= 0x80u) return false;
+        } else {
+            const bool ok_cp = (cp < 0x0250u) ||
+                (cp >= 0x0370u && cp <= 0x03FFu) ||
+                (cp >= 0x2000u && cp <= 0x2BFFu);
+            if (!ok_cp) return false;
+        }
+    }
+    return true;
+}
+
+static bool ds41_draft_vocab_prune_ready(const ds4_model *target, const ds4_tensor *output_w,
+                                         const ds4_model *draft, const ds4_dspark_stage_weights *last,
+                                         const ds4_str *vocab_tokens, uint32_t vocab_len) {
+    const char *env = getenv("DS4_DSPARK_DRAFT_VOCAB_MODE");
+    int mode = 1; /* default: latin */
+    if (env) {
+        if (!strcmp(env, "0") || !strcmp(env, "off") || !strcmp(env, "none")) return false;
+        else if (!strcmp(env, "latin")) mode = 1;
+        else if (!strcmp(env, "ascii")) mode = 2;
+        else if (!strcmp(env, "latin98k")) mode = 3;
+        else if (!strcmp(env, "latin65k")) mode = 4;
+        else return false;
+    }
+    if (!target || !output_w || !draft || !last || !vocab_tokens ||
+        output_w->type != DS4_TENSOR_Q8_0 || output_w->dim[0] != DS4_N_EMBD ||
+        output_w->dim[1] != DS4_N_VOCAB || vocab_len != DS4_N_VOCAB ||
+        !last->markov_w1 || last->markov_w1->type != DS4_TENSOR_F32 ||
+        !last->markov_w2) return false;
+
+    if (g_ds41_bf16_narrow.draft_prune_target == target &&
+        g_ds41_bf16_narrow.draft_prune_draft == draft) {
+        return !g_ds41_bf16_narrow.draft_prune_failed && g_ds41_bf16_narrow.draft_output_q8 != NULL;
+    }
+
+    ds4_gpu_tensor_free(g_ds41_bf16_narrow.draft_output_q8);
+    ds4_gpu_tensor_free(g_ds41_bf16_narrow.draft_markov_w2);
+    ds4_gpu_tensor_free(g_ds41_bf16_narrow.draft_markov_w1);
+    free(g_ds41_bf16_narrow.draft_local_to_full);
+    free(g_ds41_bf16_narrow.draft_full_to_local);
+    g_ds41_bf16_narrow.draft_output_q8 = NULL;
+    g_ds41_bf16_narrow.draft_markov_w2 = NULL;
+    g_ds41_bf16_narrow.draft_markov_w1 = NULL;
+    g_ds41_bf16_narrow.draft_local_to_full = NULL;
+    g_ds41_bf16_narrow.draft_full_to_local = NULL;
+    g_ds41_bf16_narrow.draft_vocab = 0;
+    g_ds41_bf16_narrow.draft_prune_target = target;
+    g_ds41_bf16_narrow.draft_prune_draft = draft;
+    g_ds41_bf16_narrow.draft_prune_failed = true;
+
+    ds4_gpu_tensor *full_w2 = ds41_markov_w2_bf16(draft, last->markov_w2);
+    if (!full_w2) return false;
+    const uint16_t *w2_src = (const uint16_t *)ds4_gpu_tensor_contents(full_w2);
+    if (!w2_src) return false;
+
+    uint32_t *l2f = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
+    int32_t *f2l = malloc((size_t)DS4_N_VOCAB * sizeof(int32_t));
+    if (!l2f || !f2l) { free(l2f); free(f2l); return false; }
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) f2l[i] = -1;
+
+    uint32_t nv = 0;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        char tmp[140];
+        size_t sl = vocab_tokens[i].len;
+        if (sl >= sizeof(tmp)) sl = sizeof(tmp) - 1u;
+        memcpy(tmp, vocab_tokens[i].ptr, sl);
+        tmp[sl] = 0;
+        if (ds41_draft_token_keep(i, tmp, vocab_tokens[i].len, mode)) {
+            f2l[i] = (int32_t)nv;
+            l2f[nv++] = i;
+        }
+    }
+    for (uint32_t i = 0; i < DS4_N_VOCAB && (nv & 31u) != 0u; i++) {
+        if (f2l[i] < 0) {
+            f2l[i] = (int32_t)nv;
+            l2f[nv++] = i;
+        }
+    }
+    if (nv < 1024u || nv >= DS4_N_VOCAB) { free(l2f); free(f2l); return false; }
+
+    const uint64_t q8_row = (DS4_N_EMBD / 32u) * 34u;
+    const uint64_t w2_row = 256u * sizeof(uint16_t);
+    const uint64_t w1_row = 256u * sizeof(float);
+    ds4_gpu_tensor *out_q8 = ds4_gpu_tensor_alloc_weights((uint64_t)nv * q8_row);
+    ds4_gpu_tensor *mw2 = ds4_gpu_tensor_alloc_weights((uint64_t)nv * w2_row);
+    ds4_gpu_tensor *mw1 = ds4_gpu_tensor_alloc_weights((uint64_t)nv * w1_row);
+    if (!out_q8 || !mw2 || !mw1) {
+        ds4_gpu_tensor_free(out_q8); ds4_gpu_tensor_free(mw2); ds4_gpu_tensor_free(mw1);
+        free(l2f); free(f2l);
+        return false;
+    }
+    uint8_t *dst_q8 = (uint8_t *)ds4_gpu_tensor_contents(out_q8);
+    uint8_t *dst_w2 = (uint8_t *)ds4_gpu_tensor_contents(mw2);
+    uint8_t *dst_w1 = (uint8_t *)ds4_gpu_tensor_contents(mw1);
+    const uint8_t *src_q8 = (const uint8_t *)target->map + output_w->abs_offset;
+    const uint8_t *src_w1 = (const uint8_t *)draft->map + last->markov_w1->abs_offset;
+    if (!dst_q8 || !dst_w2 || !dst_w1) {
+        ds4_gpu_tensor_free(out_q8); ds4_gpu_tensor_free(mw2); ds4_gpu_tensor_free(mw1);
+        free(l2f); free(f2l);
+        return false;
+    }
+    for (uint32_t r = 0; r < nv; r++) {
+        const uint64_t id = l2f[r];
+        memcpy(dst_q8 + (uint64_t)r * q8_row, src_q8 + id * q8_row, (size_t)q8_row);
+        memcpy(dst_w2 + (uint64_t)r * w2_row, (const uint8_t *)w2_src + id * w2_row, (size_t)w2_row);
+        memcpy(dst_w1 + (uint64_t)r * w1_row, src_w1 + id * w1_row, (size_t)w1_row);
+    }
+
+    g_ds41_bf16_narrow.draft_vocab = nv;
+    g_ds41_bf16_narrow.draft_local_to_full = l2f;
+    g_ds41_bf16_narrow.draft_full_to_local = f2l;
+    g_ds41_bf16_narrow.draft_output_q8 = out_q8;
+    g_ds41_bf16_narrow.draft_markov_w2 = mw2;
+    g_ds41_bf16_narrow.draft_markov_w1 = mw1;
+    g_ds41_bf16_narrow.draft_prune_failed = false;
+    fprintf(stderr, "ds4: DSpark pruned draft vocab enabled (mode=%d, %u/%u = %.1f%%, %.1f MiB, 100%% lossless)\n",
+            mode, nv, (unsigned)DS4_N_VOCAB, 100.0 * nv / DS4_N_VOCAB,
+            (double)((uint64_t)nv * (q8_row + w2_row + w1_row)) / 1048576.0);
+    if (g_ds41_bf16_narrow.resident) ds41_narrow_update_residency();
+    return true;
 }
 
 #if defined(__aarch64__)
@@ -84461,8 +84661,9 @@ static bool ds41_session_draft_ex(ds4_session *s, int token, bool fuse_row0_mark
     if (!d || (split && e->tp.rank == 0 &&
         !ds4_tp_send_dspark_draft(e->tp.ctx, s->tp_session_id, token,
                                   (int)g->pos, DS4_TP_DSPARK_DRAFT))) return false;
-    if (!ds41_dspark_forward_ex(d, &e->model, &e->weights, &e->mtp_model, g->pos, token, g,
-                                fuse_row0_markov && !split))
+    if (!ds41_dspark_forward_ex(d, &e->model, &e->weights, &e->mtp_model, e->vocab.token,
+                                (uint32_t)e->vocab.n_vocab, g->pos, token, g,
+                                fuse_row0_markov && !split, !split))
         return false;
     if (!split) return true;
     const uint32_t half = DS4_N_VOCAB / 2u;
@@ -87715,9 +87916,10 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
                 sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
             if (!ds41_dspark_markov_add_logits_only(d, &e->mtp_model, row, emb))
                 goto fail;
+            const uint32_t dv = d->draft_logits_vocab ? d->draft_logits_vocab : DS4_N_VOCAB;
             const float *shared_logits = (const float *)ds4_gpu_tensor_contents(d->logits);
             if (!shared_logits) goto fail;
-            qlogits = shared_logits + (uint64_t)row * DS4_N_VOCAB;
+            qlogits = shared_logits + (uint64_t)row * dv;
         } else
 #endif
         {
@@ -87726,14 +87928,45 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
                 sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
             qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
         }
+#ifdef __APPLE__
+        const uint32_t dv = fast_markov && d->draft_logits_vocab ? d->draft_logits_vocab : DS4_N_VOCAB;
+        const bool dv_pruned = (dv != DS4_N_VOCAB) && g_ds41_bf16_narrow.draft_local_to_full != NULL;
+#else
+        const uint32_t dv = DS4_N_VOCAB;
+        const bool dv_pruned = false;
+#endif
         if (exact) {
             float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
-            if (!rng || !sample_build_probabilities_ex(qlogits, DS4_N_VOCAB,
+            if (!rng || !sample_build_probabilities_ex(qlogits, dv,
                 temperature, top_k, top_p, min_p, q, &draft_sparse[row])) goto fail;
-            tokens[count] = draft_sparse[row].count > 0 ?
-                sample_sparse_draw(&draft_sparse[row], rng) :
-                sample_probabilities(q, DS4_N_VOCAB, rng);
-        } else tokens[count] = sample_argmax(qlogits, DS4_N_VOCAB);
+            if (draft_sparse[row].count > 0) {
+#ifdef __APPLE__
+                if (dv_pruned) {
+                    const uint32_t *l2f = g_ds41_bf16_narrow.draft_local_to_full;
+                    for (uint32_t si = 0; si < draft_sparse[row].count; si++)
+                        draft_sparse[row].ids[si] = (int)l2f[(uint32_t)draft_sparse[row].ids[si]];
+                }
+#endif
+                tokens[count] = sample_sparse_draw(&draft_sparse[row], rng);
+            } else {
+#ifdef __APPLE__
+                if (dv_pruned) {
+                    const uint32_t *l2f = g_ds41_bf16_narrow.draft_local_to_full;
+                    memcpy(s->sample_probs, q, (size_t)dv * sizeof(float));
+                    memset(q, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+                    for (uint32_t si = 0; si < dv; si++) q[l2f[si]] = s->sample_probs[si];
+                }
+#endif
+                tokens[count] = sample_probabilities(q, DS4_N_VOCAB, rng);
+            }
+        } else {
+            const int best_local = sample_argmax(qlogits, dv);
+#ifdef __APPLE__
+            tokens[count] = dv_pruned ? (int)g_ds41_bf16_narrow.draft_local_to_full[(uint32_t)best_local] : best_local;
+#else
+            tokens[count] = best_local;
+#endif
+        }
         if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
         if (tokens[count] == eos) { count++; break; }
     }

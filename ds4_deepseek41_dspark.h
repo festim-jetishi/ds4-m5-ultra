@@ -23,6 +23,7 @@ struct ds41_dspark {
     uint32_t saved_start;
     bool saved;
     bool row0_markov_done;
+    uint32_t draft_logits_vocab;
     ds4_gpu_tensor *chain_tokens, *chain_conf;
     ds41_gpu_graph verified[DS41_VERIFY_ROWS + 1u];
     float *host_verified;
@@ -351,20 +352,43 @@ static DS4_MAYBE_UNUSED int ds41_dspark_markov_chain(ds41_dspark *d, const ds4_m
     if (getenv("DS4_DSPARK_DISABLE_V41_GPU_MARKOV") || rows == 0 || rows > DS41_DRAFT_ROWS ||
         rank != 256 || last->markov_w1->type != DS4_TENSOR_F32 || first_token < 0 ||
         (uint32_t)first_token >= DS4_N_VOCAB) return -1;
-    const uint64_t bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+#ifdef __APPLE__
+    const uint32_t v = d->draft_logits_vocab ? d->draft_logits_vocab : DS4_N_VOCAB;
+    const bool pruned = (v != DS4_N_VOCAB) && g_ds41_bf16_narrow.draft_markov_w1 &&
+        g_ds41_bf16_narrow.draft_markov_w2 && g_ds41_bf16_narrow.draft_full_to_local;
+    int32_t local_first = first_token;
+    if (pruned) {
+        local_first = g_ds41_bf16_narrow.draft_full_to_local[(uint32_t)first_token];
+        if (local_first < 0) return -1;
+    }
+#else
+    const uint32_t v = DS4_N_VOCAB;
+    const bool pruned = false;
+    const int32_t local_first = first_token;
+#endif
+    const uint64_t bytes = (uint64_t)v * sizeof(float);
     bool ok = ds4_gpu_begin_commands();
     for (uint32_t row = 0; ok && row < rows; row++) {
         ds4_gpu_tensor *logits = ds4_gpu_tensor_view(d->logits, row * bytes, bytes);
         ok = logits &&
+#ifdef __APPLE__
+            (pruned ?
+                ds4_gpu_dsv41_markov_embed_weight_tensor(d->markov_embed, d->confidence_input,
+                    (uint64_t)DS4_N_EMBD * 4u, g_ds41_bf16_narrow.draft_markov_w1,
+                    rank, v, row ? d->chain_tokens : NULL, row, local_first) :
+                ds4_gpu_dsv41_markov_embed_tensor(d->markov_embed, d->confidence_input,
+                    (uint64_t)DS4_N_EMBD * 4u, m->map, m->size, last->markov_w1->abs_offset,
+                    rank, DS4_N_VOCAB, row ? d->chain_tokens : NULL, row, first_token)) &&
+            (pruned ?
+                (ds4_gpu_matmul_bf16_k256_add_tensor(logits, g_ds41_bf16_narrow.draft_markov_w2, v, d->markov_embed) != 0) :
+                (ds41_markov_w2_bf16(m, last->markov_w2) ?
+                    (ds4_gpu_matmul_bf16_k256_add_tensor(logits, ds41_markov_w2_bf16(m, last->markov_w2), DS4_N_VOCAB, d->markov_embed) != 0) :
+                    (ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
+                     ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB)))) &&
+#else
             ds4_gpu_dsv41_markov_embed_tensor(d->markov_embed, d->confidence_input,
                 (uint64_t)DS4_N_EMBD * 4u, m->map, m->size, last->markov_w1->abs_offset,
                 rank, DS4_N_VOCAB, row ? d->chain_tokens : NULL, row, first_token) &&
-#ifdef __APPLE__
-            (ds41_markov_w2_bf16(m, last->markov_w2) ?
-                (ds4_gpu_matmul_bf16_k256_add_tensor(logits, ds41_markov_w2_bf16(m, last->markov_w2), DS4_N_VOCAB, d->markov_embed) != 0) :
-                (ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
-                 ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB))) &&
-#else
             ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
             ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB) &&
 #endif
@@ -372,14 +396,22 @@ static DS4_MAYBE_UNUSED int ds41_dspark_markov_chain(ds41_dspark *d, const ds4_m
                 (uint64_t)row * DS4_N_EMBD * 4u, (uint64_t)DS4_N_EMBD * 4u) &&
             ds41_matmul(d->confidence, m, last->confidence_proj, d->confidence_input, false) &&
             ds4_gpu_tensor_copy(d->chain_conf, row * 4u, d->confidence, 0, 4u) &&
-            ds4_gpu_dsv41_argmax_tensor(d->chain_tokens, row + 1u, logits, DS4_N_VOCAB);
+            ds4_gpu_dsv41_argmax_tensor(d->chain_tokens, row + 1u, logits, v);
         ds4_gpu_tensor_free(logits);
     }
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     int32_t ids[DS41_VERIFY_ROWS];
     if (ok) ok = ds4_gpu_tensor_read(d->chain_tokens, 4u, ids + 1, rows * 4u) &&
         ds4_gpu_tensor_read(d->chain_conf, 0, confidence, rows * sizeof(float));
-    if (ok) for (uint32_t row = 0; row < rows; row++) tokens[row] = ids[row + 1];
+    if (ok) {
+        for (uint32_t row = 0; row < rows; row++) {
+#ifdef __APPLE__
+            tokens[row] = pruned ? (int)g_ds41_bf16_narrow.draft_local_to_full[(uint32_t)ids[row + 1]] : ids[row + 1];
+#else
+            tokens[row] = ids[row + 1];
+#endif
+        }
+    }
     return ok ? 1 : 0;
 }
 
@@ -387,18 +419,28 @@ static DS4_MAYBE_UNUSED int ds41_dspark_markov_chain(ds41_dspark *d, const ds4_m
  * GPU. Markov sampling is sequential and performed after this stage chain. */
 static DS4_MAYBE_UNUSED bool ds41_dspark_forward_ex(ds41_dspark *d, const ds4_model *target,
                                  const ds4_weights *tw, const ds4_model *draft,
+                                 const ds4_str *vocab_tokens, uint32_t vocab_len,
                                  uint32_t pos, int token, ds41_gpu_graph *target_graph,
-                                 bool fuse_row0_markov) {
+                                 bool fuse_row0_markov, bool allow_vocab_prune) {
     if (!d || !pos || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     ds41_prefill_row *b = &d->batch;
     d->row0_markov_done = false;
+    d->draft_logits_vocab = DS4_N_VOCAB;
     const bool local_experts = target_graph && target_graph->tp_world == 2;
 #ifdef __APPLE__
+    const bool use_prune = allow_vocab_prune && !local_experts &&
+        (!target_graph || !target_graph->tp_logits_half) &&
+        vocab_tokens && vocab_len == DS4_N_VOCAB &&
+        tw->output && tw->output->type == DS4_TENSOR_Q8_0 &&
+        d->weights->markov_rank == 256u &&
+        ds41_draft_vocab_prune_ready(target, tw->output, draft, &d->weights->stage[2], vocab_tokens, vocab_len) &&
+        (fuse_row0_markov || g_ds41_bf16_narrow.draft_full_to_local[(uint32_t)token] >= 0);
+    const uint32_t out_vocab = use_prune ? g_ds41_bf16_narrow.draft_vocab : DS4_N_VOCAB;
     ds4_gpu_tensor *row0_w2_bf16 = NULL;
     if (fuse_row0_markov && !local_experts && d->weights->markov_rank == 256u) {
         const ds4_dspark_stage_weights *last = &d->weights->stage[2];
         float emb0[256];
-        row0_w2_bf16 = ds41_markov_w2_bf16(draft, last->markov_w2);
+        row0_w2_bf16 = use_prune ? g_ds41_bf16_narrow.draft_markov_w2 : ds41_markov_w2_bf16(draft, last->markov_w2);
         if (row0_w2_bf16 && dspark_dense_row_to_f32(emb0, draft, last->markov_w1, (uint32_t)token)) {
             if (!ds4_gpu_tensor_write(d->markov_embed, 0, emb0, sizeof(emb0))) row0_w2_bf16 = NULL;
         } else {
@@ -406,7 +448,9 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward_ex(ds41_dspark *d, const ds4_mo
         }
     }
 #else
-    (void)fuse_row0_markov;
+    (void)vocab_tokens; (void)vocab_len; (void)fuse_row0_markov; (void)allow_vocab_prune;
+    const bool use_prune = false;
+    const uint32_t out_vocab = DS4_N_VOCAB;
 #endif
     if (local_experts) ds4_gpu_tp_suspend_expert_sharding(1);
     bool ok = ds4_gpu_begin_commands() && ds41_dspark_seed(d, draft, pos);
@@ -431,6 +475,13 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward_ex(ds41_dspark *d, const ds4_mo
         b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, DS41_DRAFT_ROWS, DS4_V41_BF16) &&
         ds41_norm_batch(b->norm, b->x, draft, d->weights->stage[2].norm, DS41_DRAFT_ROWS);
+#ifdef __APPLE__
+    if (ok && use_prune) {
+        ok = ds4_gpu_matmul_q8_0_decode_rows_weight_tensor(
+            d->logits, g_ds41_bf16_narrow.draft_output_q8, DS4_N_EMBD, out_vocab, b->norm, DS41_DRAFT_ROWS) != 0;
+        if (ok) d->draft_logits_vocab = out_vocab;
+    } else
+#endif
     if (ok) ok = target_graph ?
         ds41_output_projection(target_graph, d->logits, target, tw, b->norm, DS41_DRAFT_ROWS) :
         ds41_matmul_batch(d->logits, target, tw->output, b->norm, DS41_DRAFT_ROWS, false);
@@ -439,9 +490,9 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward_ex(ds41_dspark *d, const ds4_mo
         ok = ds41_dspark_save_rows(d, target_graph);
 #ifdef __APPLE__
     if (ok && row0_w2_bf16) {
-        const uint64_t lbytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+        const uint64_t lbytes = (uint64_t)out_vocab * sizeof(float);
         ds4_gpu_tensor *logits0 = ds4_gpu_tensor_view(d->logits, 0, lbytes);
-        ok = logits0 && ds4_gpu_matmul_bf16_k256_add_tensor(logits0, row0_w2_bf16, DS4_N_VOCAB, d->markov_embed) != 0;
+        ok = logits0 && ds4_gpu_matmul_bf16_k256_add_tensor(logits0, row0_w2_bf16, out_vocab, d->markov_embed) != 0;
         ds4_gpu_tensor_free(logits0);
         if (ok) d->row0_markov_done = true;
     }
@@ -455,7 +506,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward_ex(ds41_dspark *d, const ds4_mo
 static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model *target,
                                  const ds4_weights *tw, const ds4_model *draft,
                                  uint32_t pos, int token, ds41_gpu_graph *target_graph) {
-    return ds41_dspark_forward_ex(d, target, tw, draft, pos, token, target_graph, false);
+    return ds41_dspark_forward_ex(d, target, tw, draft, NULL, 0, pos, token, target_graph, false, false);
 }
 
 static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model *m,
@@ -521,14 +572,16 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov_add_logits_only(
     if (!d || row >= DS41_DRAFT_ROWS) return false;
     if (row == 0u && d->row0_markov_done) return true;
     const ds4_dspark_stage_weights *last = &d->weights->stage[2];
-    const uint64_t bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    const uint32_t v = d->draft_logits_vocab ? d->draft_logits_vocab : DS4_N_VOCAB;
+    const bool pruned = (v != DS4_N_VOCAB) && g_ds41_bf16_narrow.draft_markov_w2 != NULL;
+    const uint64_t bytes = (uint64_t)v * sizeof(float);
     ds4_gpu_tensor *logits = ds4_gpu_tensor_view(d->logits, row * bytes, bytes);
-    ds4_gpu_tensor *w2_bf16 = ds41_markov_w2_bf16(m, last->markov_w2);
+    ds4_gpu_tensor *w2_bf16 = pruned ? g_ds41_bf16_narrow.draft_markov_w2 : ds41_markov_w2_bf16(m, last->markov_w2);
     bool ok = logits &&
         ds4_gpu_tensor_write(d->markov_embed, 0, embedding, 256u * sizeof(float)) &&
         ds4_gpu_begin_commands() &&
         (w2_bf16 ?
-            (ds4_gpu_matmul_bf16_k256_add_tensor(logits, w2_bf16, DS4_N_VOCAB, d->markov_embed) != 0) :
+            (ds4_gpu_matmul_bf16_k256_add_tensor(logits, w2_bf16, v, d->markov_embed) != 0) :
             (ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
              ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB)));
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;

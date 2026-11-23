@@ -156,6 +156,11 @@ int ds4_gpu_dsv41_markov_embed_tensor(ds4_gpu_tensor *embed, ds4_gpu_tensor *con
                                       uint64_t model_size, uint64_t w1_offset, uint32_t rank,
                                       uint32_t vocab, const ds4_gpu_tensor *tokens,
                                       uint32_t slot, int32_t token);
+int ds4_gpu_dsv41_markov_embed_weight_tensor(ds4_gpu_tensor *embed, ds4_gpu_tensor *conf_in,
+                                             uint64_t conf_offset, const ds4_gpu_tensor *w1,
+                                             uint32_t rank, uint32_t vocab,
+                                             const ds4_gpu_tensor *tokens,
+                                             uint32_t slot, int32_t token);
 int ds4_gpu_dsv41_add_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
                                  const ds4_gpu_tensor *b, uint32_t n);
 int ds4_gpu_dsv41_attention_low_bf16_tensor(ds4_gpu_tensor *low, const void *model_map,

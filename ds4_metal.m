@@ -20013,6 +20013,69 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_bf16_tensor(
                                                 in_dim, out_dim, x, n_rows, true);
 }
 
+int ds4_gpu_matmul_q8_0_decode_rows_weight_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weight,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !weight || !x || n_rows < 2u || n_rows > 8u ||
+        in_dim == 0 || out_dim == 0 || (in_dim & 31u) != 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(weight);
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t row_bytes = (in_dim / 32u) * 34u;
+        if (!wbuf || !xbuf || !outbuf || ds4_gpu_tensor_bytes(weight) < out_dim * row_bytes) return 0;
+
+        static const char *const rows_kernels_1sg[9] = {
+            NULL, NULL,
+            "kernel_mul_mv_q8_0_f32_rows2_1sg", "kernel_mul_mv_q8_0_f32_rows3_1sg",
+            "kernel_mul_mv_q8_0_f32_rows4_1sg", "kernel_mul_mv_q8_0_f32_rows5_1sg",
+            "kernel_mul_mv_q8_0_f32_rows6_1sg", "kernel_mul_mv_q8_0_f32_rows7_1sg",
+            "kernel_mul_mv_q8_0_f32_rows8_1sg",
+        };
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        dispatch.function_name = rows_kernels_1sg[n_rows];
+        dispatch.nsg = out_dim > 32768u ? 4 : 2;
+        dispatch.nr0 = (int32_t)(2 * dispatch.nsg);
+        dispatch.smem = 0;
+
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        args.ne11 = (int32_t)n_rows;
+        args.nb12 = (uint64_t)n_rows * in_dim * sizeof(float);
+        args.nb13 = args.nb12;
+        args.ne1 = (int32_t)n_rows;
+        args.nr0 = dispatch.nr0;
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weight) atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        const NSUInteger groups = (NSUInteger)((out_dim + (uint64_t)dispatch.nr0 - 1u) / (uint64_t)dispatch.nr0);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)(32u * dispatch.nsg), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 weight tensor decode-row matvec");
+    }
+}
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -49412,6 +49475,45 @@ int ds4_gpu_dsv41_markov_embed_tensor(ds4_gpu_tensor *embed, ds4_gpu_tensor *con
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 Markov embed");
+    }
+}
+
+int ds4_gpu_dsv41_markov_embed_weight_tensor(ds4_gpu_tensor *embed, ds4_gpu_tensor *conf_in,
+                                             uint64_t conf_offset, const ds4_gpu_tensor *w1,
+                                             uint32_t rank, uint32_t vocab,
+                                             const ds4_gpu_tensor *tokens,
+                                             uint32_t slot, int32_t token) {
+    const uint64_t w1_bytes = (uint64_t)rank * vocab * sizeof(float);
+    if (!embed || !conf_in || !w1 || !rank || !vocab || ds4_gpu_tensor_bytes(w1) < w1_bytes ||
+        !dsv41_tensor_has_floats(embed, rank) ||
+        ds4_gpu_tensor_bytes(conf_in) < conf_offset + (uint64_t)rank * 4u ||
+        (tokens && ds4_gpu_tensor_bytes(tokens) < ((uint64_t)slot + 1u) * 4u)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_markov_embed_f32");
+        id<MTLBuffer> w1buf = ds4_gpu_tensor_buffer(w1);
+        if (!pipeline || !w1buf) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        const uint32_t use_tokens = tokens != NULL;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&rank length:sizeof(rank) atIndex:0];
+        [enc setBytes:&vocab length:sizeof(vocab) atIndex:1];
+        [enc setBytes:&slot length:sizeof(slot) atIndex:2];
+        [enc setBytes:&token length:sizeof(token) atIndex:3];
+        [enc setBytes:&use_tokens length:sizeof(use_tokens) atIndex:4];
+        [enc setBuffer:w1buf offset:ds4_gpu_tensor_offset(w1) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(tokens ? tokens : embed)
+                offset:ds4_gpu_tensor_offset(tokens ? tokens : embed) atIndex:6];
+        [enc setBuffer:ds4_gpu_tensor_buffer(embed) offset:ds4_gpu_tensor_offset(embed) atIndex:7];
+        [enc setBuffer:ds4_gpu_tensor_buffer(conf_in)
+                offset:ds4_gpu_tensor_offset(conf_in) + (NSUInteger)conf_offset atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rank + 255u) / 256u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 Markov embed weight");
     }
 }
 
