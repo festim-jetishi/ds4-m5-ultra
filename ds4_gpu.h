@@ -1178,6 +1178,20 @@ int ds4_gpu_matmul_f32_rows_exact_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_rows);
 
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_untracked(uint64_t bytes);
+int ds4_gpu_matmul_bf16_buf_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weights_bf16,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows);
+int ds4_gpu_matmul_bf16_k256_add_tensor(
+        ds4_gpu_tensor       *inout_logits,
+        const ds4_gpu_tensor *weights_bf16,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,

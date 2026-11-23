@@ -41233,6 +41233,71 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
      * partial pair is overwritten by its even-position token before use. */
 }
 
+
+#ifdef __APPLE__
+static struct {
+    const ds4_model *owner;
+    ds4_gpu_tensor *router[64];
+    bool router_failed;
+    const ds4_model *dspark_owner;
+    ds4_gpu_tensor *markov_w2;
+    bool markov_failed;
+} g_ds41_bf16_narrow;
+
+static ds4_gpu_tensor *ds41_build_bf16_exact(const ds4_model *m, const ds4_tensor *t) {
+    if (!m || !t || t->type != DS4_TENSOR_F32) return NULL;
+    const uint64_t n = t->dim[0] * t->dim[1];
+    if (!n || n * sizeof(float) > m->size || t->abs_offset > m->size - n * sizeof(float)) return NULL;
+    const uint32_t *src = (const uint32_t *)(m->map + t->abs_offset);
+    for (uint64_t i = 0; i < n; i++) {
+        if ((src[i] & 0xffffu) != 0u) return NULL;
+    }
+    ds4_gpu_tensor *buf = ds4_gpu_tensor_alloc_untracked(n * sizeof(uint16_t));
+    if (!buf) return NULL;
+    uint16_t *dst = (uint16_t *)ds4_gpu_tensor_contents(buf);
+    if (!dst) { ds4_gpu_tensor_free(buf); return NULL; }
+    for (uint64_t i = 0; i < n; i++) dst[i] = (uint16_t)(src[i] >> 16);
+    return buf;
+}
+
+static ds4_gpu_tensor *ds41_router_bf16(const ds4_model *m, const ds4_layer_weights *l, uint32_t il) {
+    if (getenv("DS4_METAL_DISABLE_V41_ROUTER_BF16") || il >= 64u || !l || !l->ffn_gate_inp) return NULL;
+    if (g_ds41_bf16_narrow.owner != m) {
+        for (uint32_t i = 0; i < 64u; i++) ds4_gpu_tensor_free(g_ds41_bf16_narrow.router[i]);
+        memset(g_ds41_bf16_narrow.router, 0, sizeof(g_ds41_bf16_narrow.router));
+        g_ds41_bf16_narrow.router_failed = false;
+        g_ds41_bf16_narrow.owner = m;
+    }
+    if (g_ds41_bf16_narrow.router_failed) return NULL;
+    if (!g_ds41_bf16_narrow.router[il]) {
+        g_ds41_bf16_narrow.router[il] = ds41_build_bf16_exact(m, l->ffn_gate_inp);
+        if (!g_ds41_bf16_narrow.router[il]) g_ds41_bf16_narrow.router_failed = true;
+    }
+    return g_ds41_bf16_narrow.router[il];
+}
+
+static ds4_gpu_tensor *ds41_markov_w2_bf16(const ds4_model *m, const ds4_tensor *t) {
+    if (getenv("DS4_METAL_DISABLE_DSPARK_MARKOV_BF16") || !m || !t || t->dim[0] != 256u) return NULL;
+    if (g_ds41_bf16_narrow.dspark_owner != m) {
+        ds4_gpu_tensor_free(g_ds41_bf16_narrow.markov_w2);
+        g_ds41_bf16_narrow.markov_w2 = NULL;
+        g_ds41_bf16_narrow.markov_failed = false;
+        g_ds41_bf16_narrow.dspark_owner = m;
+    }
+    if (g_ds41_bf16_narrow.markov_failed) return NULL;
+    if (!g_ds41_bf16_narrow.markov_w2) {
+        g_ds41_bf16_narrow.markov_w2 = ds41_build_bf16_exact(m, t);
+        if (!g_ds41_bf16_narrow.markov_w2) {
+            g_ds41_bf16_narrow.markov_failed = true;
+        } else {
+            fprintf(stderr, "ds4: DSpark narrow BF16 markov_w2 enabled (%.2f MiB, bit-exact)\n",
+                    (double)(t->dim[0] * t->dim[1] * sizeof(uint16_t)) / 1048576.0);
+        }
+    }
+    return g_ds41_bf16_narrow.markov_w2;
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
                                               const ds4_weights *w, const char *path,
                                               uint32_t ctx, bool streaming, ds41_workspace *ws) {
@@ -41352,6 +41417,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
      * GPU runs layer 0 (and layers 1-13 for the second table). */
     g->engram_reader = ds4_engram_reader_create();
     ds41_graph_reset(g);
+#ifdef __APPLE__
+    if (!streaming && g_ds41_bf16_narrow.owner != m && !getenv("DS4_METAL_DISABLE_V41_ROUTER_BF16")) {
+        uint32_t built = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (ds41_router_bf16(m, &w->layer[il], il)) built++;
+        }
+        if (built == DS4_N_LAYER) {
+            fprintf(stderr, "ds4: V4.1 narrow BF16 router enabled (%u layers, %.2f MiB, bit-exact)\n",
+                    built, (double)built * DS4_N_EMBD * DS4_N_EXPERT * sizeof(uint16_t) / 1048576.0);
+        }
+    }
+#endif
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
             (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
     return true;
@@ -41934,7 +42011,15 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
-    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
+#ifdef __APPLE__
+    ds4_gpu_tensor *rbf16 = ds41_router_bf16(m, l, il);
+    const bool r_ok = rbf16 ?
+        (ds4_gpu_matmul_bf16_buf_rows_tensor(g->route_logits, rbf16, DS4_N_EMBD, DS4_N_EXPERT, g->norm, 1u) != 0) :
+        ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false);
+#else
+    const bool r_ok = ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false);
+#endif
+    if (!r_ok ||
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
@@ -42517,7 +42602,10 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds41_fused_bf16(l->ffn_up_shexp) && ds41_fused_bf16(l->ffn_down_shexp) &&
         ds4_gpu_concurrent_begin()) {
         ds4_gpu_concurrent_serial(1);
-        bool ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
+        ds4_gpu_tensor *rbf16 = ds41_router_bf16(m, l, il);
+        bool ok = rbf16 ?
+            (ds4_gpu_matmul_bf16_buf_rows_tensor(b->route_logits, rbf16, DS4_N_EMBD, DS4_N_EXPERT, b->norm, count) != 0) :
+            ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
         ds4_gpu_concurrent_serial(0);
         ok = ok && ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
             ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true);
@@ -42545,7 +42633,15 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         return ok && ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
     }
 #endif
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+#ifdef __APPLE__
+    ds4_gpu_tensor *rbf16_nc = (count >= 1u && count <= 8u) ? ds41_router_bf16(m, l, il) : NULL;
+    const bool route_mat_ok = rbf16_nc ?
+        (ds4_gpu_matmul_bf16_buf_rows_tensor(b->route_logits, rbf16_nc, DS4_N_EMBD, DS4_N_EXPERT, b->norm, count) != 0) :
+        ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
+#else
+    const bool route_mat_ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
+#endif
+    return route_mat_ok &&
         ds41_route_batch(g, m, l, count) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&

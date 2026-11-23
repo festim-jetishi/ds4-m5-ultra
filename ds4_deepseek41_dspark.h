@@ -358,8 +358,15 @@ static DS4_MAYBE_UNUSED int ds41_dspark_markov_chain(ds41_dspark *d, const ds4_m
             ds4_gpu_dsv41_markov_embed_tensor(d->markov_embed, d->confidence_input,
                 (uint64_t)DS4_N_EMBD * 4u, m->map, m->size, last->markov_w1->abs_offset,
                 rank, DS4_N_VOCAB, row ? d->chain_tokens : NULL, row, first_token) &&
+#ifdef __APPLE__
+            (ds41_markov_w2_bf16(m, last->markov_w2) ?
+                (ds4_gpu_matmul_bf16_k256_add_tensor(logits, ds41_markov_w2_bf16(m, last->markov_w2), DS4_N_VOCAB, d->markov_embed) != 0) :
+                (ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
+                 ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB))) &&
+#else
             ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
             ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB) &&
+#endif
             ds4_gpu_tensor_copy(d->confidence_input, 0, d->batch.x,
                 (uint64_t)row * DS4_N_EMBD * 4u, (uint64_t)DS4_N_EMBD * 4u) &&
             ds41_matmul(d->confidence, m, last->confidence_proj, d->confidence_input, false) &&
@@ -431,8 +438,15 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
     ds4_gpu_tensor *logits = ds4_gpu_tensor_view(d->logits, row * bytes, bytes);
     bool ok = logits && ds4_gpu_begin_commands() &&
         ds4_gpu_tensor_write(d->markov_embed, 0, embedding, sizeof(embedding)) &&
+#ifdef __APPLE__
+        (ds41_markov_w2_bf16(m, last->markov_w2) ?
+            (ds4_gpu_matmul_bf16_k256_add_tensor(logits, ds41_markov_w2_bf16(m, last->markov_w2), DS4_N_VOCAB, d->markov_embed) != 0) :
+            (ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
+             ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB))) &&
+#else
         ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
         ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB) &&
+#endif
         ds4_gpu_tensor_copy(d->confidence_input, 0, d->batch.x,
             (uint64_t)row * DS4_N_EMBD * 4u, (uint64_t)DS4_N_EMBD * 4u) &&
         ds4_gpu_tensor_copy(d->confidence_input, (uint64_t)DS4_N_EMBD * 4u,
