@@ -158,6 +158,9 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+int ds4_kvstore_best_prefix_tokens(ds4_kvstore *kc, const char *prompt_text,
+                                   int model_id, int quant_bits, int ctx_size,
+                                   uint8_t *ext_flags_out);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,

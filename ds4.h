@@ -485,6 +485,32 @@ void ds4_session_free_test_checkpoint(ds4_session *s);
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,
                                  const ds4_vision_span *images, size_t n);
+
+/* Lightweight in-RAM frontier anchor snapshots (DeepSeek V4.1 single-host GPU
+ * and unit-test checkpoints).  V4.1 compressed/index KV caches are strictly
+ * append-only, so capturing the 128-row raw window (BF16, bit-exact for
+ * FP8_E8M0), odd-pair pool state, and logits (~5.5 MiB) enables ~0.1 ms
+ * bit-exact rewind to any captured boundary regardless of context length. */
+#define DS4_SESSION_MAX_ANCHORS  10
+#define DS4_ANCHOR_TAG_NORMAL    0u
+#define DS4_ANCHOR_TAG_SYSTEM    1u
+#define DS4_ANCHOR_TAG_TURN_END  2u
+
+bool ds4_session_supports_anchors(const ds4_session *s);
+bool ds4_session_capture_anchor(ds4_session *s, uint32_t tag);
+bool ds4_session_has_anchor_at(const ds4_session *s, int pos);
+int ds4_session_best_anchor_le(const ds4_session *s, int max_pos);
+bool ds4_session_anchor_vision_matches(const ds4_session *s,
+                                       int anchor_pos,
+                                       const ds4_vision_span *images,
+                                       size_t image_count);
+bool ds4_session_anchor_vision_fingerprint_matches(const ds4_session *s,
+                                                   int anchor_pos,
+                                                   const ds4_vision_span *images,
+                                                   size_t image_count);
+bool ds4_session_restore_anchor(ds4_session *s, int pos);
+void ds4_session_clear_anchors(ds4_session *s);
+void ds4_session_set_test_anchor(ds4_session *s, int pos, uint32_t tag);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,

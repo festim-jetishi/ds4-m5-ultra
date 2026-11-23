@@ -62925,9 +62925,26 @@ struct ds4_session {
     int exact_next_pos;
     float exact_next_temp, exact_next_top_p, exact_next_min_p;
     int exact_next_top_k;
+    struct {
+        bool valid;
+        uint32_t pos;
+        uint32_t tag;
+        uint32_t raw_rows;
+        uint64_t token_hash;
+        size_t image_count;
+        uint16_t *window_bf16;
+        float prev_kv[3][512];
+        float prev_score[3][512];
+        ds4_engram_history history;
+        float *logits;
+        uint64_t seq;
+    } anchors[DS4_SESSION_MAX_ANCHORS];
+    uint64_t anchor_seq;
+    bool test_checkpoint;
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
+static bool ds4_session_restore_anchor_force(ds4_session *s, int pos);
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -65041,50 +65058,75 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 #endif
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+enum {
+    DS41_SPAN_RAW = 0,
+    DS41_SPAN_BF16 = 1,
+    DS41_SPAN_COMP = 2,
+};
+
 typedef struct {
     ds4_gpu_tensor *tensor;
-    uint64_t bytes;
+    uint64_t bytes;   /* serialized byte length on disk */
+    uint8_t kind;
 } ds41_state_span;
 
+#define DS41_PAYLOAD_TAG_F32     0x413431u
+#define DS41_PAYLOAD_TAG_F16     0x413432u
+#define DS41_PAYLOAD_TAG_COMPACT 0x413433u
+
+static uint32_t ds41_save_payload_tag(const ds41_gpu_graph *g) {
+    if (!g || !g->comp_f16) return DS41_PAYLOAD_TAG_F32;
+    return getenv("DS4_V41_DISABLE_COMPACT_KV_DISK") ? DS41_PAYLOAD_TAG_F16
+                                                      : DS41_PAYLOAD_TAG_COMPACT;
+}
+
 /* The selection masks are rebuilt by each index-source layer on the next
- * token. Only owner caches, windows and unfinished compression pairs persist. */
+ * token. Only owner caches, windows and unfinished compression pairs persist.
+ * In DS41_PAYLOAD_TAG_COMPACT ("A43"), raw windows (FP8_E8M0 -> dsv41_bf16)
+ * and indexer keys (FP4_E8M0 -> dsv41_bf16) are stored as exact BF16 alongside
+ * FP16 compressed KV, cutting disk size and I/O time in half bit-losslessly. */
 static uint32_t ds41_state_spans_fmt(ds41_gpu_graph *g, uint32_t pos,
-                                     ds41_state_span spans[54], bool comp_f16) {
+                                     ds41_state_span spans[54], uint32_t tag) {
     uint32_t n = 0;
+    const bool comp_f16 = tag != DS41_PAYLOAD_TAG_F32;
+    const bool compact = tag == DS41_PAYLOAD_TAG_COMPACT;
     const uint32_t raw = pos < 128u ? pos : 128u;
     for (uint32_t il = 0; il < 40; il++)
-        spans[n++] = (ds41_state_span){g->window[il], (uint64_t)raw * 512u * 4u};
+        spans[n++] = (ds41_state_span){
+            g->window[il],
+            (uint64_t)raw * 512u * (compact ? 2u : 4u),
+            compact ? DS41_SPAN_BF16 : DS41_SPAN_RAW
+        };
     for (uint32_t i = 0; i < 4; i++) {
         const uint32_t live = pos / (i < 3 ? 2u : 1u);
-        spans[n++] = (ds41_state_span){g->compressed[i],
-                                       (uint64_t)live * ds41_comp_row_bytes(comp_f16)};
-        spans[n++] = (ds41_state_span){g->index_cache[i], (uint64_t)live * 128u * 4u};
+        spans[n++] = (ds41_state_span){
+            g->compressed[i],
+            (uint64_t)live * ds41_comp_row_bytes(comp_f16),
+            DS41_SPAN_COMP
+        };
+        spans[n++] = (ds41_state_span){
+            g->index_cache[i],
+            (uint64_t)live * 128u * (compact ? 2u : 4u),
+            compact ? DS41_SPAN_BF16 : DS41_SPAN_RAW
+        };
         if (i < 3 && (pos & 1u)) {
-            spans[n++] = (ds41_state_span){g->previous_kv[i], 512u * 4u};
-            spans[n++] = (ds41_state_span){g->previous_score[i], 512u * 4u};
+            spans[n++] = (ds41_state_span){g->previous_kv[i], 512u * 4u, DS41_SPAN_RAW};
+            spans[n++] = (ds41_state_span){g->previous_score[i], 512u * 4u, DS41_SPAN_RAW};
         }
     }
     return n;
 }
 
-static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
-                                 ds41_state_span spans[54]) {
-    return ds41_state_spans_fmt(g, pos, spans, g->comp_f16);
-}
-
-#define DS41_PAYLOAD_TAG_F32 0x413431u
-#define DS41_PAYLOAD_TAG_F16 0x413432u
-
-static uint64_t ds41_payload_body_bytes_fmt(ds41_gpu_graph *g, uint32_t pos, bool comp_f16) {
+static uint64_t ds41_payload_body_bytes_fmt(ds41_gpu_graph *g, uint32_t pos, uint32_t tag) {
     ds41_state_span spans[54];
-    const uint32_t n = ds41_state_spans_fmt(g, pos, spans, comp_f16);
+    const uint32_t n = ds41_state_spans_fmt(g, pos, spans, tag);
     uint64_t bytes = ((uint64_t)pos + DS4_N_VOCAB) * sizeof(float);
     for (uint32_t i = 0; i < n; i++) bytes += spans[i].bytes;
     return bytes;
 }
 
 static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
-    return ds41_payload_body_bytes_fmt(g, pos, g->comp_f16);
+    return ds41_payload_body_bytes_fmt(g, pos, ds41_save_payload_tag(g));
 }
 
 static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
@@ -65094,10 +65136,11 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "V4.1 graph has no complete frontier to save");
         return 1;
     }
+    const uint32_t tag = ds41_save_payload_tag(g);
     const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
         g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB,
-        g->comp_f16 ? DS41_PAYLOAD_TAG_F16 : DS41_PAYLOAD_TAG_F32
+        tag
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
         if (payload_write_u32(fp, h[i], err, errlen)) return 1;
@@ -65105,12 +65148,32 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen)) return 1;
     if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, err, errlen)) return 1;
     ds41_state_span spans[54];
-    const uint32_t n = ds41_state_spans(g, g->pos, spans);
+    const uint32_t n = ds41_state_spans_fmt(g, g->pos, spans, tag);
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    uint16_t *bf16_buf = tag == DS41_PAYLOAD_TAG_COMPACT ?
+        xmalloc(DS4_SESSION_IO_CHUNK / 2u) : NULL;
     int rc = 0;
-    for (uint32_t i = 0; i < n && !rc; i++)
-        rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
-                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    for (uint32_t i = 0; i < n && !rc; i++) {
+        if (spans[i].kind != DS41_SPAN_BF16) {
+            rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
+                                           buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            continue;
+        }
+        const uint64_t total_elems = spans[i].bytes / 2u;
+        const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
+        for (uint64_t done = 0; done < total_elems && !rc; done += step) {
+            const uint64_t k = total_elems - done < step ? total_elems - done : step;
+            if (!ds4_gpu_tensor_read(spans[i].tensor, done * 4u, buf, k * 4u)) {
+                payload_set_err(err, errlen, "V4.1 compact snapshot tensor read failed");
+                rc = 1;
+                break;
+            }
+            const uint32_t *src = (const uint32_t *)buf;
+            for (uint64_t e = 0; e < k; e++) bf16_buf[e] = (uint16_t)(src[e] >> 16u);
+            rc = payload_write_bytes(fp, bf16_buf, k * 2u, err, errlen);
+        }
+    }
+    free(bf16_buf);
     free(buf);
     return rc;
 }
@@ -65119,11 +65182,13 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
     ds41_gpu_graph *g = &s->ds41_graph;
     const uint32_t pos = h[7];
+    const uint32_t tag = h[12];
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
         h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
         h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
-        (h[12] != DS41_PAYLOAD_TAG_F32 && h[12] != DS41_PAYLOAD_TAG_F16) ||
-        remaining != ds41_payload_body_bytes_fmt(g, pos, h[12] == DS41_PAYLOAD_TAG_F16)) {
+        (tag != DS41_PAYLOAD_TAG_F32 && tag != DS41_PAYLOAD_TAG_F16 &&
+         tag != DS41_PAYLOAD_TAG_COMPACT) ||
+        remaining != ds41_payload_body_bytes_fmt(g, pos, tag)) {
         payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
         return 1;
     }
@@ -65144,6 +65209,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     if (!rc && !ds4_gpu_synchronize()) rc = 1;
     t_sync = now_sec();
     if (!rc) {
+        ds4_session_clear_anchors(s);
         s->checkpoint_valid = false;
         g->valid = false;
         rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, &remaining, err, errlen);
@@ -65153,14 +65219,30 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             rc = 1;
         }
         t_logits = now_sec();
-        const bool file_f16 = h[12] == DS41_PAYLOAD_TAG_F16;
+        const bool file_f16 = tag != DS41_PAYLOAD_TAG_F32;
         ds41_state_span spans[54];
-        const uint32_t n = ds41_state_spans_fmt(g, pos, spans, file_f16);
+        const uint32_t n = ds41_state_spans_fmt(g, pos, spans, tag);
         uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+        uint32_t *f32_buf = tag == DS41_PAYLOAD_TAG_COMPACT ?
+            xmalloc(DS4_SESSION_IO_CHUNK) : NULL;
         for (uint32_t i = 0; i < n && !rc; i++) {
-            bool comp = false;
-            for (uint32_t c = 0; c < 4; c++) comp |= spans[i].tensor == g->compressed[c];
-            if (!comp || file_f16 == g->comp_f16) {
+            if (spans[i].kind == DS41_SPAN_BF16) {
+                const uint64_t total_elems = spans[i].bytes / 2u;
+                const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
+                for (uint64_t done = 0; done < total_elems && !rc; done += step) {
+                    const uint64_t k = total_elems - done < step ? total_elems - done : step;
+                    rc = payload_read_bytes(fp, buf, k * 2u, &remaining, err, errlen);
+                    if (rc) break;
+                    const uint16_t *src = (const uint16_t *)buf;
+                    for (uint64_t e = 0; e < k; e++) f32_buf[e] = (uint32_t)src[e] << 16u;
+                    if (!ds4_gpu_tensor_write(spans[i].tensor, done * 4u, f32_buf, k * 4u)) {
+                        payload_set_err(err, errlen, "V4.1 compact snapshot restore write failed");
+                        rc = 1;
+                    }
+                }
+                continue;
+            }
+            if (spans[i].kind != DS41_SPAN_COMP || file_f16 == g->comp_f16) {
                 rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                                buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
                 continue;
@@ -65184,6 +65266,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             }
             free(out);
         }
+        free(f32_buf);
         free(buf);
         if (!rc) {
             ds41_graph_reset(g);
@@ -76467,6 +76550,13 @@ void ds4_session_free(ds4_session *s) {
     ds4_session_print_dspark_stats(s);
 #endif
     ds4_dist_session_free(s->distributed);
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        free(s->anchors[i].window_bf16);
+        free(s->anchors[i].logits);
+        s->anchors[i].window_bf16 = NULL;
+        s->anchors[i].logits = NULL;
+        s->anchors[i].valid = false;
+    }
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
@@ -78599,9 +78689,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
         if (!s->checkpoint_valid || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
             !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            ds4_session_clear_anchors(s);
             ds41_graph_reset(g);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+        }
+        /* Capture a lightweight safety anchor before a multi-token prefill
+         * chunk so mid-chunk cancellation can restore the exact pre-chunk
+         * frontier without losing a warm session. */
+        if (s->checkpoint_valid && s->checkpoint.len > 0 &&
+            prompt->len > s->checkpoint.len &&
+            ds4_session_supports_anchors(s) &&
+            !ds4_session_has_anchor_at(s, s->checkpoint.len)) {
+            ds4_session_capture_anchor(s, DS4_ANCHOR_TAG_NORMAL);
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
         ds41_workspace_enter(g);
@@ -78642,6 +78742,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds41_encoder_release(g, &e->model, &encoder);
                 s->checkpoint_valid = false;
                 if (ds4_session_cancelled(s)) {
+                    int safe = ds4_session_best_anchor_le(s, s->checkpoint.len);
+                    if (safe > 0) (void)ds4_session_restore_anchor_force(s, safe);
                     snprintf(err, errlen, "interrupted");
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
@@ -78661,6 +78763,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         if (decoder_pending) {
             s->checkpoint_valid = false;
             g->valid = false;
+            int safe = ds4_session_best_anchor_le(s, s->checkpoint.len);
+            if (safe > 0) (void)ds4_session_restore_anchor_force(s, safe);
             snprintf(err, errlen, "interrupted");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
@@ -79617,6 +79721,14 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
     if (common == s->checkpoint.len) {
         return ds4_session_sync(s, prompt, err, errlen) == 0 ?
             DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
+    }
+
+    if (ds4_session_supports_anchors(s)) {
+        int anchor = ds4_session_best_anchor_le(s, common);
+        if (anchor > 0 && ds4_session_restore_anchor(s, anchor)) {
+            return ds4_session_sync(s, prompt, err, errlen) == 0 ?
+                DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
+        }
     }
 
     if (ds4_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
@@ -87842,6 +87954,11 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         g->pos != (uint32_t)s->checkpoint.len) return -1;
     if (cap > (int)(g->ctx - g->pos)) cap = (int)(g->ctx - g->pos);
     if (cap < 1) return 0;
+    if (ds4_session_cancelled(s)) {
+        s->exact_next_token_valid = false;
+        snprintf(err, errlen, "interrupted");
+        return -DS4_SESSION_SYNC_INTERRUPTED;
+    }
     if (cap > (int)DS41_VERIFY_ROWS) cap = DS41_VERIFY_ROWS;
     const uint32_t draft_cap = ds4_dspark_env_u32("DS4_DSPARK_VERIFY_CAP", 0);
     if (draft_cap && draft_cap < (uint32_t)cap - 1u) cap = (int)draft_cap + 1;
@@ -87984,8 +88101,9 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         return 1;
     }
     if (ds4_session_cancelled(s)) {
+        s->exact_next_token_valid = false;
         snprintf(err, errlen, "interrupted");
-        return -1;
+        return -DS4_SESSION_SYNC_INTERRUPTED;
     }
     s->ds41_empty_drafts = 0;
     const double proposed = now_sec();
@@ -89295,6 +89413,7 @@ void ds4_session_invalidate(ds4_session *s) {
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
     }
+    ds4_session_clear_anchors(s);
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
@@ -89456,6 +89575,8 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
     if (ds4_session_rewind_speculative(s, pos)) return;
+    if (ds4_session_supports_anchors(s) && ds4_session_has_anchor_at(s, pos) &&
+        ds4_session_restore_anchor(s, pos)) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos))
@@ -89520,15 +89641,313 @@ bool ds4_session_checkpoint_valid(const ds4_session *s) {
     return s && s->checkpoint_valid;
 }
 
+static uint64_t ds4_tokens_fnv1a(const int *v, int n) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (int i = 0; i < n; i++) {
+        uint32_t x = (uint32_t)v[i];
+        h ^= (uint64_t)(x & 0xffu);        h *= UINT64_C(1099511628211);
+        h ^= (uint64_t)((x >> 8) & 0xffu); h *= UINT64_C(1099511628211);
+        h ^= (uint64_t)((x >> 16) & 0xffu);h *= UINT64_C(1099511628211);
+        h ^= (uint64_t)((x >> 24) & 0xffu);h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+bool ds4_session_supports_anchors(const ds4_session *s) {
+    if (!s) return false;
+    if (s->test_checkpoint) return true;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    return !s->distributed && ds4_session_is_ds41(s) && s->ds41_graph_ready &&
+           !ds4_session_tp_leader(s);
+#else
+    return false;
+#endif
+}
+
+void ds4_session_clear_anchors(ds4_session *s) {
+    if (!s) return;
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        s->anchors[i].valid = false;
+        s->anchors[i].pos = 0;
+        s->anchors[i].tag = 0;
+        s->anchors[i].raw_rows = 0;
+        s->anchors[i].token_hash = 0;
+        s->anchors[i].image_count = 0;
+        s->anchors[i].seq = 0;
+    }
+}
+
+static int ds4_anchor_find_index(const ds4_session *s, int pos) {
+    if (!s || pos <= 0) return -1;
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        if (s->anchors[i].valid && s->anchors[i].pos == (uint32_t)pos) return i;
+    }
+    return -1;
+}
+
+static int ds4_anchor_pick_slot(ds4_session *s, uint32_t pos) {
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        if (s->anchors[i].valid && s->anchors[i].pos == pos) return i;
+    }
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        if (!s->anchors[i].valid) return i;
+    }
+    /* Tiered eviction: prefer evicting oldest NORMAL (pre_asst/prompt_end)
+     * before TURN_END, and never evict sticky SYSTEM unless all slots are SYSTEM. */
+    int best = -1;
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        if (s->anchors[i].tag != DS4_ANCHOR_TAG_NORMAL) continue;
+        if (best < 0 || s->anchors[i].seq < s->anchors[best].seq) best = i;
+    }
+    if (best >= 0) return best;
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        if (s->anchors[i].tag == DS4_ANCHOR_TAG_SYSTEM) continue;
+        if (best < 0 || s->anchors[i].seq < s->anchors[best].seq) best = i;
+    }
+    if (best >= 0) return best;
+    best = 0;
+    for (int i = 1; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        if (s->anchors[i].seq < s->anchors[best].seq) best = i;
+    }
+    return best;
+}
+
+static size_t ds4_anchor_image_prefix_count(const ds4_session *s, uint32_t pos) {
+    size_t count = 0;
+    while (count < s->checkpoint_image_count) {
+        const ds4_vision_identity *img = &s->checkpoint_images[count];
+        if ((uint64_t)img->token_start + (uint64_t)img->token_count > (uint64_t)pos) break;
+        count++;
+    }
+    return count;
+}
+
+bool ds4_session_capture_anchor(ds4_session *s, uint32_t tag) {
+    if (!ds4_session_supports_anchors(s)) return false;
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0) return false;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    if (s->test_checkpoint) {
+        int idx = ds4_anchor_pick_slot(s, pos);
+        s->anchors[idx].valid = true;
+        s->anchors[idx].pos = pos;
+        s->anchors[idx].tag = tag;
+        s->anchors[idx].raw_rows = pos < 128u ? pos : 128u;
+        s->anchors[idx].token_hash = ds4_tokens_fnv1a(s->checkpoint.v, (int)pos);
+        s->anchors[idx].image_count = ds4_anchor_image_prefix_count(s, pos);
+        s->anchors[idx].seq = ++s->anchor_seq;
+        return true;
+    }
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    ds41_gpu_graph *g = &s->ds41_graph;
+    if (!g->valid || g->pos != pos || !s->logits) return false;
+    if (!ds4_gpu_synchronize()) return false;
+    const int idx = ds4_anchor_pick_slot(s, pos);
+    const uint32_t raw_rows = pos < 128u ? pos : 128u;
+    if (!s->anchors[idx].window_bf16) {
+        s->anchors[idx].window_bf16 = xmalloc(40u * 128u * 512u * sizeof(uint16_t));
+    }
+    if (!s->anchors[idx].logits) {
+        s->anchors[idx].logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    uint32_t *tmp = xmalloc((size_t)raw_rows * 512u * sizeof(uint32_t));
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < 40u; il++) {
+        const uint64_t elems = (uint64_t)raw_rows * 512u;
+        if (!ds4_gpu_tensor_read(g->window[il], 0, tmp, elems * sizeof(uint32_t))) {
+            ok = false;
+            break;
+        }
+        uint16_t *dst = s->anchors[idx].window_bf16 + (size_t)il * 128u * 512u;
+        for (uint64_t e = 0; e < elems; e++) dst[e] = (uint16_t)(tmp[e] >> 16u);
+    }
+    free(tmp);
+    if (ok && (pos & 1u)) {
+        for (uint32_t i = 0; ok && i < 3u; i++) {
+            ok = ds4_gpu_tensor_read(g->previous_kv[i], 0, s->anchors[idx].prev_kv[i], 512u * sizeof(float)) &&
+                 ds4_gpu_tensor_read(g->previous_score[i], 0, s->anchors[idx].prev_score[i], 512u * sizeof(float));
+        }
+    }
+    if (!ok) return false;
+    memcpy(s->anchors[idx].logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    s->anchors[idx].history = g->history;
+    s->anchors[idx].valid = true;
+    s->anchors[idx].pos = pos;
+    s->anchors[idx].tag = tag;
+    s->anchors[idx].raw_rows = raw_rows;
+    s->anchors[idx].token_hash = ds4_tokens_fnv1a(s->checkpoint.v, (int)pos);
+    s->anchors[idx].image_count = ds4_anchor_image_prefix_count(s, pos);
+    s->anchors[idx].seq = ++s->anchor_seq;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool ds4_session_has_anchor_at(const ds4_session *s, int pos) {
+    return ds4_anchor_find_index(s, pos) >= 0;
+}
+
+int ds4_session_best_anchor_le(const ds4_session *s, int max_pos) {
+    if (!s || max_pos <= 0) return -1;
+    int best = -1;
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        if (!s->anchors[i].valid) continue;
+        int p = (int)s->anchors[i].pos;
+        if (p <= max_pos && p > best) best = p;
+    }
+    return best;
+}
+
+bool ds4_session_anchor_vision_matches(const ds4_session *s,
+                                       int anchor_pos,
+                                       const ds4_vision_span *images,
+                                       size_t image_count) {
+    if (!s || (image_count != 0 && !images)) return false;
+    int idx = ds4_anchor_find_index(s, anchor_pos);
+    if (idx < 0) return false;
+    const size_t n = s->anchors[idx].image_count;
+    if (n > image_count || n > s->checkpoint_image_count) return false;
+    for (size_t i = 0; i < n; i++) {
+        const ds4_vision_identity *old = &s->checkpoint_images[i];
+        const ds4_vision_span *cur = &images[i];
+        if (old->token_start != cur->token_start ||
+            old->token_count != cur->embedding.token_count ||
+            memcmp(old->fingerprint, cur->embedding.fingerprint,
+                   sizeof(old->fingerprint)) != 0)
+            return false;
+    }
+    if (n < image_count && images[n].token_start < (uint32_t)anchor_pos)
+        return false;
+    return true;
+}
+
+bool ds4_session_anchor_vision_fingerprint_matches(const ds4_session *s,
+                                                   int anchor_pos,
+                                                   const ds4_vision_span *images,
+                                                   size_t image_count) {
+    if (!s || (image_count != 0 && !images)) return false;
+    int idx = ds4_anchor_find_index(s, anchor_pos);
+    if (idx < 0) return false;
+    const size_t n = s->anchors[idx].image_count;
+    if (n > image_count || n > s->checkpoint_image_count) return false;
+    for (size_t i = 0; i < n; i++) {
+        const ds4_vision_identity *old = &s->checkpoint_images[i];
+        const ds4_vision_span *cur = &images[i];
+        if (old->token_count != cur->embedding.token_count ||
+            memcmp(old->fingerprint, cur->embedding.fingerprint,
+                   sizeof(old->fingerprint)) != 0)
+            return false;
+    }
+    return true;
+}
+
+static bool ds4_session_restore_anchor_impl(ds4_session *s, int pos, bool allow_invalid_graph) {
+    if (!ds4_session_supports_anchors(s) || pos <= 0) return false;
+    int idx = ds4_anchor_find_index(s, pos);
+    if (idx < 0) return false;
+    if (pos > s->checkpoint.len) return false;
+    if (ds4_tokens_fnv1a(s->checkpoint.v, pos) != s->anchors[idx].token_hash) return false;
+    if (s->test_checkpoint) {
+        if (!allow_invalid_graph && !s->checkpoint_valid) return false;
+        s->checkpoint.len = pos;
+        if (s->anchors[idx].image_count < s->checkpoint_image_count)
+            s->checkpoint_image_count = s->anchors[idx].image_count;
+        s->checkpoint_valid = true;
+        for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+            if (s->anchors[i].valid && s->anchors[i].pos > (uint32_t)pos)
+                s->anchors[i].valid = false;
+        }
+        return true;
+    }
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    ds41_gpu_graph *g = &s->ds41_graph;
+    if (!allow_invalid_graph && (!s->checkpoint_valid || !g->valid || g->pos < (uint32_t)pos))
+        return false;
+    if (!s->anchors[idx].window_bf16 || !s->anchors[idx].logits || !s->logits) return false;
+    if (!ds4_gpu_synchronize()) return false;
+    const uint32_t raw_rows = s->anchors[idx].raw_rows;
+    uint32_t *tmp = xmalloc((size_t)raw_rows * 512u * sizeof(uint32_t));
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < 40u; il++) {
+        const uint64_t elems = (uint64_t)raw_rows * 512u;
+        const uint16_t *src = s->anchors[idx].window_bf16 + (size_t)il * 128u * 512u;
+        for (uint64_t e = 0; e < elems; e++) tmp[e] = (uint32_t)src[e] << 16u;
+        if (!ds4_gpu_tensor_write(g->window[il], 0, tmp, elems * sizeof(uint32_t))) {
+            ok = false;
+            break;
+        }
+    }
+    free(tmp);
+    if (ok && ((uint32_t)pos & 1u)) {
+        for (uint32_t i = 0; ok && i < 3u; i++) {
+            ok = ds4_gpu_tensor_write(g->previous_kv[i], 0, s->anchors[idx].prev_kv[i], 512u * sizeof(float)) &&
+                 ds4_gpu_tensor_write(g->previous_score[i], 0, s->anchors[idx].prev_score[i], 512u * sizeof(float));
+        }
+    }
+    if (ok) {
+        memcpy(s->logits, s->anchors[idx].logits, (size_t)DS4_N_VOCAB * sizeof(float));
+        ok = ds4_gpu_tensor_write(g->logits, 0, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (!ok) {
+        g->valid = false;
+        s->checkpoint_valid = false;
+        return false;
+    }
+    ds41_graph_reset(g);
+    g->history = s->anchors[idx].history;
+    g->pos = (uint32_t)pos;
+    g->valid = true;
+    s->checkpoint.len = pos;
+    if (s->anchors[idx].image_count < s->checkpoint_image_count)
+        s->checkpoint_image_count = s->anchors[idx].image_count;
+    s->checkpoint_valid = true;
+    s->exact_next_token_valid = false;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_invalidate(s);
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        if (s->anchors[i].valid && s->anchors[i].pos > (uint32_t)pos)
+            s->anchors[i].valid = false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+static bool ds4_session_restore_anchor_force(ds4_session *s, int pos) {
+    return ds4_session_restore_anchor_impl(s, pos, true);
+}
+
+bool ds4_session_restore_anchor(ds4_session *s, int pos) {
+    return ds4_session_restore_anchor_impl(s, pos, false);
+}
+
+void ds4_session_set_test_anchor(ds4_session *s, int pos, uint32_t tag) {
+    if (!s || !s->test_checkpoint || pos <= 0 || pos > s->checkpoint.len) return;
+    int idx = ds4_anchor_pick_slot(s, (uint32_t)pos);
+    s->anchors[idx].valid = true;
+    s->anchors[idx].pos = (uint32_t)pos;
+    s->anchors[idx].tag = tag;
+    s->anchors[idx].raw_rows = (uint32_t)pos < 128u ? (uint32_t)pos : 128u;
+    s->anchors[idx].token_hash = ds4_tokens_fnv1a(s->checkpoint.v, pos);
+    s->anchors[idx].image_count = ds4_anchor_image_prefix_count(s, (uint32_t)pos);
+    s->anchors[idx].seq = ++s->anchor_seq;
+}
+
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
     s->checkpoint_valid = true;
+    s->test_checkpoint = true;
     return s;
 }
 
 void ds4_session_free_test_checkpoint(ds4_session *s) {
     if (!s) return;
+    for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
+        free(s->anchors[i].window_bf16);
+        free(s->anchors[i].logits);
+    }
     token_vec_free(&s->checkpoint);
     free(s->checkpoint_images);
     free(s);
