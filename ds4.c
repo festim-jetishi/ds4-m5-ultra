@@ -37,6 +37,9 @@
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
 #endif
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -45873,19 +45876,86 @@ static void sample_heap_sift_down(sample_candidate *heap, uint32_t n, uint32_t i
 /* Materialize the exact distribution represented by the public sampling
  * knobs. Speculative decoding needs probabilities, rather than only a sampled
  * token, for the p/q acceptance test and the corrected rejection sample. */
-static bool sample_build_probabilities(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        int          top_k,
-        float        top_p,
-        float        min_p,
-        float       *probs) {
-    if (!logits || !probs || n_vocab == 0) return false;
-    memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
+enum { SAMPLE_SPARSE_CAP = 512 };
+typedef struct {
+    uint32_t count; /* > 0 when valid sparse representation; 0 means use dense probs[] */
+    int      ids[SAMPLE_SPARSE_CAP];
+    float    probs[SAMPLE_SPARSE_CAP];
+} sample_sparse_dist;
+
+static inline bool sample_find_max_finite(const float *logits, uint32_t n_vocab,
+                                          float *max_out, uint32_t *finite_out) {
+#if defined(__aarch64__)
+    if (n_vocab >= 16u) {
+        const uint32x4_t exp_mask = vdupq_n_u32(0x7f800000u);
+        uint32x4_t bad = vdupq_n_u32(0u);
+        float32x4_t vm0 = vdupq_n_f32(DS4_NEG_INF);
+        float32x4_t vm1 = vm0, vm2 = vm0, vm3 = vm0;
+        uint32_t i = 0;
+        for (; i + 16u <= n_vocab; i += 16u) {
+            float32x4_t v0 = vld1q_f32(logits + i);
+            float32x4_t v1 = vld1q_f32(logits + i + 4u);
+            float32x4_t v2 = vld1q_f32(logits + i + 8u);
+            float32x4_t v3 = vld1q_f32(logits + i + 12u);
+            bad = vorrq_u32(bad, vceqq_u32(vandq_u32(vreinterpretq_u32_f32(v0), exp_mask), exp_mask));
+            bad = vorrq_u32(bad, vceqq_u32(vandq_u32(vreinterpretq_u32_f32(v1), exp_mask), exp_mask));
+            bad = vorrq_u32(bad, vceqq_u32(vandq_u32(vreinterpretq_u32_f32(v2), exp_mask), exp_mask));
+            bad = vorrq_u32(bad, vceqq_u32(vandq_u32(vreinterpretq_u32_f32(v3), exp_mask), exp_mask));
+            vm0 = vmaxnmq_f32(vm0, v0);
+            vm1 = vmaxnmq_f32(vm1, v1);
+            vm2 = vmaxnmq_f32(vm2, v2);
+            vm3 = vmaxnmq_f32(vm3, v3);
+        }
+        if (__builtin_expect(vmaxvq_u32(bad) == 0u, 1)) {
+            float m = vmaxnmvq_f32(vmaxnmq_f32(vmaxnmq_f32(vm0, vm1), vmaxnmq_f32(vm2, vm3)));
+            bool all_ok = true;
+            for (; i < n_vocab; i++) {
+                const float v = logits[i];
+                if (!isfinite(v)) { all_ok = false; break; }
+                if (v > m) m = v;
+            }
+            if (all_ok) {
+                *max_out = m;
+                *finite_out = n_vocab;
+                return true;
+            }
+        }
+    }
+#endif
+    uint32_t finite = 0;
+    float max_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (!isfinite(logits[i])) continue;
+        finite++;
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+    *max_out = max_logit;
+    *finite_out = finite;
+    return finite == n_vocab;
+}
+
+static bool sample_build_probabilities_ex(
+        const float        *logits,
+        uint32_t            n_vocab,
+        float               temperature,
+        int                 top_k,
+        float               top_p,
+        float               min_p,
+        float              *probs,
+        sample_sparse_dist *sparse_out) {
+    if (!logits || (!probs && !sparse_out) || n_vocab == 0) return false;
+    if (sparse_out) sparse_out->count = 0;
 
     if (temperature <= 0.0f) {
-        probs[sample_argmax(logits, n_vocab)] = 1.0f;
+        const int best = sample_argmax(logits, n_vocab);
+        if (sparse_out) {
+            sparse_out->count = 1;
+            sparse_out->ids[0] = best;
+            sparse_out->probs[0] = 1.0f;
+            return true;
+        }
+        memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
+        probs[best] = 1.0f;
         return true;
     }
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
@@ -45899,40 +45969,77 @@ static bool sample_build_probabilities(
     const uint32_t heap_cap = top_k > 0 ? (uint32_t)top_k :
         (uint32_t)SAMPLE_PROB_FAST_CAP;
     uint32_t finite = 0;
-    uint32_t heap_n = 0;
     float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        if (!isfinite(logits[i])) continue;
-        finite++;
-        if (logits[i] > max_logit) max_logit = logits[i];
-    }
+    const bool all_finite = sample_find_max_finite(logits, n_vocab, &max_logit, &finite);
     if (finite == 0) {
-        probs[sample_argmax(logits, n_vocab)] = 1.0f;
+        const int best = sample_argmax(logits, n_vocab);
+        if (sparse_out) {
+            sparse_out->count = 1;
+            sparse_out->ids[0] = best;
+            sparse_out->probs[0] = 1.0f;
+            return true;
+        }
+        memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
+        probs[best] = 1.0f;
         return true;
     }
 
+    const float inv_temp = 1.0f / temperature;
+    /* expf(-28) = 6.9e-13; summed across 129,280 vocab < FP32 machine epsilon. */
+    const bool use_cutoff = n_vocab > 2048u && isfinite(max_logit - 28.0f * temperature);
+    const float cutoff = use_cutoff ? max_logit - 28.0f * temperature : DS4_NEG_INF;
+
+    uint32_t heap_n = 0;
+    uint32_t kept = 0;
     float full_sum = 0.0f;
     float heap_sum = 0.0f;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float raw = expf((v - max_logit) / temperature);
-        full_sum += raw;
-        sample_candidate cand = {.id = (int)i, .logit = v, .prob = raw};
-        if (heap_n < heap_cap) {
-            heap[heap_n] = cand;
-            heap_sum += raw;
-            sample_heap_sift_up(heap, heap_n);
-            heap_n++;
-        } else if (sample_candidate_gt(cand, heap[0])) {
-            heap_sum -= heap[0].prob;
-            heap[0] = cand;
-            heap_sum += raw;
-            sample_heap_sift_down(heap, heap_n, 0);
+
+#define SAMPLE_PUSH_CAND(idx_, val_) do {         const float raw_ = expf(((val_) - max_logit) * inv_temp);         full_sum += raw_;         kept++;         sample_candidate cand_ = {.id = (int)(idx_), .logit = (val_), .prob = raw_};         if (heap_n < heap_cap) {             heap[heap_n] = cand_;             heap_sum += raw_;             sample_heap_sift_up(heap, heap_n);             heap_n++;         } else if (sample_candidate_gt(cand_, heap[0])) {             heap_sum -= heap[0].prob;             heap[0] = cand_;             heap_sum += raw_;             sample_heap_sift_down(heap, heap_n, 0);         }     } while (0)
+
+#if defined(__aarch64__)
+    if (use_cutoff && all_finite) {
+        const float32x4_t vcut = vdupq_n_f32(cutoff);
+        uint32_t i = 0;
+        for (; i + 16u <= n_vocab; i += 16u) {
+            float32x4_t v0 = vld1q_f32(logits + i);
+            float32x4_t v1 = vld1q_f32(logits + i + 4u);
+            float32x4_t v2 = vld1q_f32(logits + i + 8u);
+            float32x4_t v3 = vld1q_f32(logits + i + 12u);
+            uint32x4_t any = vorrq_u32(
+                vorrq_u32(vcgeq_f32(v0, vcut), vcgeq_f32(v1, vcut)),
+                vorrq_u32(vcgeq_f32(v2, vcut), vcgeq_f32(v3, vcut)));
+            if (__builtin_expect(vmaxvq_u32(any) == 0u, 1)) continue;
+            for (uint32_t j = i; j < i + 16u; j++) {
+                const float v = logits[j];
+                if (v >= cutoff) SAMPLE_PUSH_CAND(j, v);
+            }
+        }
+        for (; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (v >= cutoff) SAMPLE_PUSH_CAND(i, v);
+        }
+    } else
+#endif
+    {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!all_finite && !isfinite(v)) continue;
+            if (use_cutoff && v < cutoff) continue;
+            SAMPLE_PUSH_CAND(i, v);
         }
     }
+#undef SAMPLE_PUSH_CAND
+
     if (full_sum <= 0.0f || !isfinite(full_sum) || heap_n == 0) {
-        probs[sample_argmax(logits, n_vocab)] = 1.0f;
+        const int best = sample_argmax(logits, n_vocab);
+        if (sparse_out) {
+            sparse_out->count = 1;
+            sparse_out->ids[0] = best;
+            sparse_out->probs[0] = 1.0f;
+            return true;
+        }
+        memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
+        probs[best] = 1.0f;
         return true;
     }
 
@@ -45956,7 +46063,7 @@ static bool sample_build_probabilities(
         }
     }
 
-    const bool heap_has_all = heap_n == finite;
+    const bool heap_has_all = heap_n == kept;
     const bool min_p_proves_tail_filtered =
         stopped_by_min_p && heap[heap_n - 1u].prob < min_raw;
     const bool fast_complete = top_k > 0 || heap_has_all || reached_top_p ||
@@ -45966,15 +46073,16 @@ static bool sample_build_probabilities(
     uint32_t cand_n = heap_n;
     bool owned = false;
     if (!fast_complete) {
-        cand = xmalloc((size_t)finite * sizeof(cand[0]));
+        cand = xmalloc((size_t)kept * sizeof(cand[0]));
         cand_n = 0;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
-            if (!isfinite(v)) continue;
+            if (!all_finite && !isfinite(v)) continue;
+            if (use_cutoff && v < cutoff) continue;
             cand[cand_n++] = (sample_candidate){
                 .id = (int)i,
                 .logit = v,
-                .prob = expf((v - max_logit) / temperature),
+                .prob = expf((v - max_logit) * inv_temp),
             };
         }
         qsort(cand, cand_n, sizeof(cand[0]), sample_candidate_cmp_desc);
@@ -45991,6 +46099,28 @@ static bool sample_build_probabilities(
         owned = true;
     }
 
+    if (sparse_out && filtered <= (uint32_t)SAMPLE_SPARSE_CAP) {
+        if (filtered == 0 || filtered_sum <= 0.0f || !isfinite(filtered_sum)) {
+            sparse_out->count = 1;
+            sparse_out->ids[0] = cand[0].id;
+            sparse_out->probs[0] = 1.0f;
+        } else {
+            const float inv_sum = 1.0f / filtered_sum;
+            sparse_out->count = filtered;
+            for (uint32_t i = 0; i < filtered; i++) {
+                sparse_out->ids[i] = cand[i].id;
+                sparse_out->probs[i] = cand[i].prob * inv_sum;
+            }
+        }
+        if (owned) free(cand);
+        return true;
+    }
+
+    if (!probs) {
+        if (owned) free(cand);
+        return false;
+    }
+    memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
     if (filtered == 0 || filtered_sum <= 0.0f || !isfinite(filtered_sum)) {
         probs[cand[0].id] = 1.0f;
     } else {
@@ -46001,6 +46131,87 @@ static bool sample_build_probabilities(
     }
     if (owned) free(cand);
     return true;
+}
+
+static bool sample_build_probabilities(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        int          top_k,
+        float        top_p,
+        float        min_p,
+        float       *probs) {
+    return sample_build_probabilities_ex(logits, n_vocab, temperature,
+                                         top_k, top_p, min_p, probs, NULL);
+}
+
+static int sample_sparse_draw(const sample_sparse_dist *d, uint64_t *rng) {
+    if (!d || d->count == 0 || !rng) return -1;
+    if (d->count == 1) { (void)sample_rng_f32(rng); return d->ids[0]; }
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < d->count; i++) sum += d->probs[i];
+    if (sum <= 0.0f || !isfinite(sum)) return d->ids[0];
+    float r = sample_rng_f32(rng) * sum;
+    for (uint32_t i = 0; i < d->count; i++) {
+        r -= d->probs[i];
+        if (r <= 0.0f) return d->ids[i];
+    }
+    return d->ids[0];
+}
+
+static float sample_sparse_lookup(const sample_sparse_dist *d, int token) {
+    for (uint32_t i = 0; i < d->count; i++) {
+        if (d->ids[i] == token) return d->probs[i];
+    }
+    return 0.0f;
+}
+
+static int sample_sparse_residual(const sample_sparse_dist *p,
+                                  const sample_sparse_dist *q,
+                                  uint64_t *rng) {
+    enum { HASH_SZ = 1024, HASH_MASK = HASH_SZ - 1 };
+    float res[SAMPLE_SPARSE_CAP];
+    float sum = 0.0f;
+    if (q->count <= 24u) {
+        for (uint32_t i = 0; i < p->count; i++) {
+            const float qp = sample_sparse_lookup(q, p->ids[i]);
+            float r = p->probs[i] - qp;
+            if (!(r > 0.0f) || !isfinite(r)) r = 0.0f;
+            res[i] = r;
+            sum += r;
+        }
+    } else {
+        int keys[HASH_SZ];
+        float vals[HASH_SZ];
+        for (int i = 0; i < HASH_SZ; i++) keys[i] = -1;
+        for (uint32_t i = 0; i < q->count; i++) {
+            uint32_t h = ((uint32_t)q->ids[i] * 2654435761u) & (uint32_t)HASH_MASK;
+            while (keys[h] != -1) h = (h + 1u) & (uint32_t)HASH_MASK;
+            keys[h] = q->ids[i];
+            vals[h] = q->probs[i];
+        }
+        for (uint32_t i = 0; i < p->count; i++) {
+            const int id = p->ids[i];
+            uint32_t h = ((uint32_t)id * 2654435761u) & (uint32_t)HASH_MASK;
+            float qp = 0.0f;
+            while (keys[h] != -1) {
+                if (keys[h] == id) { qp = vals[h]; break; }
+                h = (h + 1u) & (uint32_t)HASH_MASK;
+            }
+            float r = p->probs[i] - qp;
+            if (!(r > 0.0f) || !isfinite(r)) r = 0.0f;
+            res[i] = r;
+            sum += r;
+        }
+    }
+    if (sum <= 0.0f || !isfinite(sum)) return p->ids[0];
+    float u = sample_rng_f32(rng) * sum;
+    for (uint32_t i = 0; i < p->count; i++) {
+        if (res[i] <= 0.0f) continue;
+        u -= res[i];
+        if (u <= 0.0f) return p->ids[i];
+    }
+    return p->ids[0];
 }
 
 static int sample_probabilities(const float *probs, uint32_t n_vocab,
@@ -46077,24 +46288,46 @@ static bool sample_fast_top_p(
     float sum = 0.0f;
     float heap_sum = 0.0f;
 
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float p = expf((v - max_logit) / temperature);
-        sum += p;
-        sample_candidate cand = {.id = (int)i, .logit = v, .prob = p};
-        if (n < cap) {
-            heap[n] = cand;
-            heap_sum += p;
-            sample_heap_sift_up(heap, n);
-            n++;
-        } else if (sample_candidate_gt(cand, heap[0])) {
-            heap_sum -= heap[0].prob;
-            heap[0] = cand;
-            heap_sum += p;
-            sample_heap_sift_down(heap, n, 0);
+    const float inv_temp = 1.0f / temperature;
+    const bool use_cutoff = n_vocab > 2048u && isfinite(max_logit - 28.0f * temperature);
+    const float cutoff = use_cutoff ? max_logit - 28.0f * temperature : DS4_NEG_INF;
+    const bool all_finite = finite == n_vocab;
+    uint32_t kept = 0;
+#define FTP_PUSH(idx_, val_) do {         const float p_ = expf(((val_) - max_logit) * inv_temp);         sum += p_;         kept++;         sample_candidate cand_ = {.id = (int)(idx_), .logit = (val_), .prob = p_};         if (n < cap) {             heap[n] = cand_;             heap_sum += p_;             sample_heap_sift_up(heap, n);             n++;         } else if (sample_candidate_gt(cand_, heap[0])) {             heap_sum -= heap[0].prob;             heap[0] = cand_;             heap_sum += p_;             sample_heap_sift_down(heap, n, 0);         }     } while (0)
+#if defined(__aarch64__)
+    if (use_cutoff && all_finite) {
+        const float32x4_t vcut = vdupq_n_f32(cutoff);
+        uint32_t i = 0;
+        for (; i + 16u <= n_vocab; i += 16u) {
+            float32x4_t v0 = vld1q_f32(logits + i);
+            float32x4_t v1 = vld1q_f32(logits + i + 4u);
+            float32x4_t v2 = vld1q_f32(logits + i + 8u);
+            float32x4_t v3 = vld1q_f32(logits + i + 12u);
+            uint32x4_t any = vorrq_u32(
+                vorrq_u32(vcgeq_f32(v0, vcut), vcgeq_f32(v1, vcut)),
+                vorrq_u32(vcgeq_f32(v2, vcut), vcgeq_f32(v3, vcut)));
+            if (__builtin_expect(vmaxvq_u32(any) == 0u, 1)) continue;
+            for (uint32_t j = i; j < i + 16u; j++) {
+                const float v = logits[j];
+                if (v >= cutoff) FTP_PUSH(j, v);
+            }
+        }
+        for (; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (v >= cutoff) FTP_PUSH(i, v);
+        }
+    } else
+#endif
+    {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!all_finite && !isfinite(v)) continue;
+            if (use_cutoff && v < cutoff) continue;
+            FTP_PUSH(i, v);
         }
     }
+#undef FTP_PUSH
+    finite = kept;
     if (sum <= 0.0f || !isfinite(sum)) {
         *token_out = best;
         return true;
@@ -86982,6 +87215,8 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             if (tokens[count] == eos) { count++; break; }
         }
     }
+    sample_sparse_dist draft_sparse[DS41_DRAFT_ROWS];
+    for (uint32_t r = 0; r < DS41_DRAFT_ROWS; r++) draft_sparse[r].count = 0;
     for (; chain < 0 && count < (uint32_t)cap; count++) {
         const uint32_t row = count - 1u;
         float confidence;
@@ -86991,9 +87226,11 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
         if (exact) {
             float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
-            if (!rng || !sample_build_probabilities(qlogits, DS4_N_VOCAB,
-                temperature, top_k, top_p, min_p, q)) goto fail;
-            tokens[count] = sample_probabilities(q, DS4_N_VOCAB, rng);
+            if (!rng || !sample_build_probabilities_ex(qlogits, DS4_N_VOCAB,
+                temperature, top_k, top_p, min_p, q, &draft_sparse[row])) goto fail;
+            tokens[count] = draft_sparse[row].count > 0 ?
+                sample_sparse_draw(&draft_sparse[row], rng) :
+                sample_probabilities(q, DS4_N_VOCAB, rng);
         } else tokens[count] = sample_argmax(qlogits, DS4_N_VOCAB);
         if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
         if (tokens[count] == eos) { count++; break; }
@@ -87030,12 +87267,32 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         if (!exact) {
             if (sample_argmax(p_logits, DS4_N_VOCAB) != tokens[keep]) break;
         } else {
-            float *q = d->draft_probs + (uint64_t)(keep - 1u) * DS4_N_VOCAB;
-            if (!sample_build_probabilities(p_logits, DS4_N_VOCAB,
-                temperature, top_k, top_p, min_p, s->sample_probs)) goto fail;
+            const uint32_t row = keep - 1u;
+            float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
+            sample_sparse_dist p_sparse;
+            if (!sample_build_probabilities_ex(p_logits, DS4_N_VOCAB,
+                temperature, top_k, top_p, min_p, s->sample_probs, &p_sparse)) goto fail;
             const int token = tokens[keep];
-            if (sample_rng_f32(rng) * q[token] > s->sample_probs[token]) {
-                correction = sample_residual_probabilities(s->sample_probs, q, DS4_N_VOCAB, rng);
+            const float q_tok = draft_sparse[row].count > 0 ?
+                sample_sparse_lookup(&draft_sparse[row], token) : q[token];
+            const float p_tok = p_sparse.count > 0 ?
+                sample_sparse_lookup(&p_sparse, token) : s->sample_probs[token];
+            if (sample_rng_f32(rng) * q_tok > p_tok) {
+                if (p_sparse.count > 0 && draft_sparse[row].count > 0) {
+                    correction = sample_sparse_residual(&p_sparse, &draft_sparse[row], rng);
+                } else {
+                    if (p_sparse.count > 0) {
+                        memset(s->sample_probs, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+                        for (uint32_t j = 0; j < p_sparse.count; j++)
+                            s->sample_probs[p_sparse.ids[j]] = p_sparse.probs[j];
+                    }
+                    if (draft_sparse[row].count > 0) {
+                        memset(q, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+                        for (uint32_t j = 0; j < draft_sparse[row].count; j++)
+                            q[draft_sparse[row].ids[j]] = draft_sparse[row].probs[j];
+                    }
+                    correction = sample_residual_probabilities(s->sample_probs, q, DS4_N_VOCAB, rng);
+                }
                 break;
             }
         }
