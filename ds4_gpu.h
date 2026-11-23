@@ -1203,6 +1203,17 @@ int ds4_gpu_matmul_e4m3_bf16_rows_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint32_t                n_rows);
+int ds4_gpu_dsv41_shared_mid_swiglu_q8_0_rows_tensor(
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_rows,
+        float                   clamp);
 #endif
 
 int ds4_gpu_repeat_hc_tensor(

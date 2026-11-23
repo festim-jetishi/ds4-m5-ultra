@@ -42873,28 +42873,46 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             (ds4_gpu_matmul_bf16_buf_rows_tensor(b->route_logits, rbf16, DS4_N_EMBD, DS4_N_EXPERT, b->norm, count) != 0) :
             ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
         ds4_gpu_concurrent_serial(0);
-        ok = ok && ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-            ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true);
-        ds4_gpu_concurrent_barrier();
-        ds4_gpu_concurrent_serial(1);
-        ok = ok && ds41_route_batch(g, m, l, count);
-        ds4_gpu_concurrent_serial(0);
-        ok = ok && ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f);
-        ds4_gpu_concurrent_barrier();
-        ok = ok && ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16);
-        /* Serial mode: the routed function's own dispatches stay ordered; the
-         * shared down then runs beside its last one (the routed down). */
-        ds4_gpu_concurrent_serial(1);
-        ok = ok && ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
-            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
-            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
-            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
-            il, count, &mid_f16, !g->verify_prefix);
-        ds4_gpu_concurrent_serial(0);
-        ok = ok && ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true);
+        const bool shared_fused = !g->quality && !getenv("DS4_METAL_DISABLE_V41_SHARED_FUSION") &&
+            ds4_gpu_dsv41_shared_mid_swiglu_q8_0_rows_tensor(b->shared_mid, m->map, m->size,
+                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, DS4_N_FF_EXP, b->norm, count, DS4_SWIGLU_CLAMP_EXP) != 0;
+        if (shared_fused) {
+            /* Serial mode inserts the single barrier waiting for both router and fused shared_mid,
+             * then orders route_batch -> routed_moe; shared_down runs beside routed_down. */
+            ds4_gpu_concurrent_serial(1);
+            ok = ok && ds41_route_batch(g, m, l, count) &&
+                ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+                    m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                    l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                    gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+                    DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+                    DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+                    il, count, &mid_f16, !g->verify_prefix);
+            ds4_gpu_concurrent_serial(0);
+            ok = ok && ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true);
+        } else {
+            ok = ok && ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+                ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true);
+            ds4_gpu_concurrent_barrier();
+            ds4_gpu_concurrent_serial(1);
+            ok = ok && ds41_route_batch(g, m, l, count);
+            ds4_gpu_concurrent_serial(0);
+            ok = ok && ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+                count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f);
+            ds4_gpu_concurrent_barrier();
+            ok = ok && ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16);
+            ds4_gpu_concurrent_serial(1);
+            ok = ok && ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+                m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+                il, count, &mid_f16, !g->verify_prefix);
+            ds4_gpu_concurrent_serial(0);
+            ok = ok && ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true);
+        }
         ds4_gpu_concurrent_end();
         return ok && ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
     }
@@ -42910,12 +42928,21 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     return route_mat_ok &&
         ds41_route_batch(g, m, l, count) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
-        (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
-        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
+        ((
+#ifdef __APPLE__
+          (count >= 1u && count <= 8u && !g->quality &&
+           l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+           !getenv("DS4_METAL_DISABLE_V41_SHARED_FUSION") &&
+           ds4_gpu_dsv41_shared_mid_swiglu_q8_0_rows_tensor(b->shared_mid, m->map, m->size,
+               l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+               DS4_N_EMBD, DS4_N_FF_EXP, b->norm, count, DS4_SWIGLU_CLAMP_EXP) != 0) ||
+#endif
+          (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+           ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
+           ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+               count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+           ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16))) &&
+         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         (!balance_shared || ds4_gpu_dsv41_shared_mask(b->shared, b->selected,
             DS4_N_EMBD, count, DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank, il & 1u)) &&
