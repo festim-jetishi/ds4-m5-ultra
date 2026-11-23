@@ -147,7 +147,7 @@ kernel void kernel_argsort_f32_i32(
 }
 
 // Host-visible sort variant used by DS4 top-k selection.
-template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
+template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 
 struct ds4_metal_args_dsv41_router {
     uint32_t n_expert;

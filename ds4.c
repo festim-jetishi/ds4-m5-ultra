@@ -40993,6 +40993,7 @@ typedef struct {
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *verify_previous_kv[4], *verify_previous_score[4];
     bool verify_prefix;
+    bool score_selected_blocks;
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
@@ -42106,16 +42107,19 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             idx_q_ok = ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true);
 #endif
         }
-        if ((!g->batch_prepass &&
-             (!idx_q_ok ||
-              !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
-              !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-              !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true))) ||
+        if (!g->batch_prepass &&
+            (!idx_q_ok ||
+             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
+             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
+             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true))) return false;
 #ifdef __APPLE__
-            !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+        if (il > 20 && n_comp > 2048u * 8u && g->score_selected_blocks) {
+            if (!ds4_gpu_dsv41_indexer_score_blocks(g->index_scores, g->index_q, g->index_weights,
+                    g->index_cache[owner], g->block_selected, n_comp, 2048u)) return false;
+        } else if (!ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
 #else
-            !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
+        if (!ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
 #endif
     }
@@ -43024,6 +43028,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer N while the CPU encodes layer N+1. Same drain points as TP. */
     const bool pipeline_layers = g->tp_world == 1 && !g->imatrix && !layer_resident &&
         !getenv("DS4_METAL_DISABLE_V41_PIPELINE_DECODE");
+#ifdef __APPLE__
+    g->score_selected_blocks = !g->streaming && g->tp_world == 1 &&
+        !getenv("DS4_V41_DISABLE_CANDIDATE_SCORING") &&
+        !getenv("DS4_METAL_DISABLE_V41_SCORE_ROWS4");
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -43056,6 +43065,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+    g->score_selected_blocks = false;
     const bool fold_logits = pipeline_layers && logits && ok;
     if (!fold_logits && ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;

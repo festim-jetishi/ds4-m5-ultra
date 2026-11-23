@@ -2062,6 +2062,110 @@ kernel void kernel_glm_indexer_score_one_simd(
     }
 }
 
+/* Four rows per SIMD group, sixteen per threadgroup: zero threadgroup memory,
+ * zero barriers, reuses q4[lane] across four keys. Bit-identical to
+ * kernel_glm_indexer_score_one_direct via #pragma clang fp contract(off). */
+static inline float4 glm_indexer_cache_row4(
+        device const char *indexer_key_cache,
+        uint row,
+        ushort lane,
+        uint cache_f16) {
+    const uint64_t idx = (uint64_t)row * 128u + (uint64_t)lane * 4u;
+    if (cache_f16 != 0u) {
+        return float4(glm_cache_load_f32_or_f16(indexer_key_cache, idx + 0u, cache_f16),
+                      glm_cache_load_f32_or_f16(indexer_key_cache, idx + 1u, cache_f16),
+                      glm_cache_load_f32_or_f16(indexer_key_cache, idx + 2u, cache_f16),
+                      glm_cache_load_f32_or_f16(indexer_key_cache, idx + 3u, cache_f16));
+    }
+    return *(device const float4 *)((device const float *)indexer_key_cache + idx);
+}
+
+static inline float4 glm_indexer_score_rows_in_simd(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        uint r0, uint r1, uint r2, uint r3,
+        ushort lane) {
+    const float4 kv0 = glm_indexer_cache_row4(indexer_key_cache, r0, lane, args.cache_f16);
+    const float4 kv1 = glm_indexer_cache_row4(indexer_key_cache, r1, lane, args.cache_f16);
+    const float4 kv2 = glm_indexer_cache_row4(indexer_key_cache, r2, lane, args.cache_f16);
+    const float4 kv3 = glm_indexer_cache_row4(indexer_key_cache, r3, lane, args.cache_f16);
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint head = 0; head < 32u; head++) {
+        device const float4 *q4 = (device const float4 *)(q + (uint64_t)head * 128u);
+        float s0 = dot(q4[lane], kv0);
+        float s1 = dot(q4[lane], kv1);
+        float s2 = dot(q4[lane], kv2);
+        float s3 = dot(q4[lane], kv3);
+        s0 = simd_sum(s0);
+        s1 = simd_sum(s1);
+        s2 = simd_sum(s2);
+        s3 = simd_sum(s3);
+        if (lane == 0u) {
+            const float t0 = max(s0 * args.scale, 0.0f) * weights[head];
+            const float t1 = max(s1 * args.scale, 0.0f) * weights[head];
+            const float t2 = max(s2 * args.scale, 0.0f) * weights[head];
+            const float t3 = max(s3 * args.scale, 0.0f) * weights[head];
+            {
+#pragma clang fp contract(off)
+                a0 += t0;
+                a1 += t1;
+                a2 += t2;
+                a3 += t3;
+            }
+        }
+    }
+    return float4(a0, a1, a2, a3);
+}
+
+static inline void glm_indexer_score_four_rows(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        uint first, ushort lane) {
+    const uint r0 = first, r1 = first + 1u, r2 = first + 2u, r3 = first + 3u;
+    const float4 acc = glm_indexer_score_rows_in_simd(args, q, weights, indexer_key_cache,
+            r0 < args.n_rows ? r0 : 0u, r1 < args.n_rows ? r1 : 0u,
+            r2 < args.n_rows ? r2 : 0u, r3 < args.n_rows ? r3 : 0u, lane);
+    if (lane == 0u) {
+        if (r0 < args.n_rows) scores[r0] = acc.x;
+        if (r1 < args.n_rows) scores[r1] = acc.y;
+        if (r2 < args.n_rows) scores[r2] = acc.z;
+        if (r3 < args.n_rows) scores[r3] = acc.w;
+    }
+}
+
+kernel void kernel_glm_indexer_score_one_rows4(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        uint tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    glm_indexer_score_four_rows(args, q, weights, indexer_key_cache, scores, tg * 16u + (uint)sg * 4u, lane);
+}
+
+kernel void kernel_dsv41_indexer_score_blocks(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const uint *blocks,
+        uint tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint block = blocks[tg];
+    if (block > (args.n_rows - 1u) / 8u) return;
+    glm_indexer_score_four_rows(args, q, weights, indexer_key_cache, scores, block * 8u + (uint)sg * 4u, lane);
+}
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,

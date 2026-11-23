@@ -435,6 +435,8 @@ static id<MTLComputePipelineState> g_bf16_r1_rows_pipeline;
 static id<MTLComputePipelineState> g_bf16_k256_add_pipeline;
 static id<MTLComputePipelineState> g_e4m3_8b_r2_pipelines[8];
 static id<MTLComputePipelineState> g_dsv41_shared_mid_pipelines[8];
+static id<MTLComputePipelineState> g_glm_indexer_score_one_rows4_pipeline;
+static id<MTLComputePipelineState> g_dsv41_indexer_score_blocks_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
@@ -12083,6 +12085,8 @@ void ds4_gpu_cleanup(void) {
         g_bf16_k256_add_pipeline = nil;
         for (int i = 0; i < 8; i++) g_e4m3_8b_r2_pipelines[i] = nil;
         for (int i = 0; i < 8; i++) g_dsv41_shared_mid_pipelines[i] = nil;
+        g_glm_indexer_score_one_rows4_pipeline = nil;
+        g_dsv41_indexer_score_blocks_pipeline = nil;
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
         [g_q4_expert_layer_residency_cache removeAllObjects];
@@ -37270,6 +37274,31 @@ int ds4_gpu_glm_indexer_score_one_tensor(
             .scale = scale,
         };
 
+        static int rows4_env = -1;
+        if (rows4_env < 0) rows4_env = getenv("DS4_METAL_DISABLE_V41_SCORE_ROWS4") == NULL;
+        if (n_head == 32u && head_dim == 128u && rows4_env) {
+            id<MTLComputePipelineState> rows4_pipeline = g_glm_indexer_score_one_rows4_pipeline;
+            if (!rows4_pipeline) {
+                rows4_pipeline = ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_rows4");
+                if (!rows4_pipeline) return 0;
+                g_glm_indexer_score_one_rows4_pipeline = rows4_pipeline;
+            }
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:rows4_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+            [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
+            [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 15u) / 16u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM indexer rows4 score")) return 0;
+            return 1;
+        }
         static int simd_env = -1;
         if (simd_env < 0) simd_env = !getenv("DS4_METAL_DISABLE_INDEXER_SIMD_SCORE");
         /* Only long caches gain: with few keys the per-SIMD-group key loop
@@ -49650,6 +49679,40 @@ int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
                                   uint32_t start, uint32_t ratio) {
     if (!block_mask) return 0;
     return dsv41_candidates(scores, scores, block_mask, width, rows, start, ratio);
+}
+
+int ds4_gpu_dsv41_indexer_score_blocks(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *blocks, uint32_t visible_rows, uint32_t block_count) {
+    if (!visible_rows || !block_count || block_count > ((uint64_t)visible_rows + 7u) / 8u ||
+        !dsv41_tensor_has_floats(scores, visible_rows) ||
+        !dsv41_tensor_has_floats(q, 32u * 128u) || !dsv41_tensor_has_floats(weights, 32u) ||
+        !dsv41_tensor_has_floats(keys, (uint64_t)visible_rows * 128u) ||
+        !dsv41_tensor_has_floats(blocks, block_count)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = g_dsv41_indexer_score_blocks_pipeline;
+        if (!pipeline) {
+            pipeline = ds4_gpu_get_pipeline("kernel_dsv41_indexer_score_blocks");
+            if (!pipeline) return 0;
+            g_dsv41_indexer_score_blocks_pipeline = pipeline;
+        }
+        const ds4_gpu_glm_indexer_score_one_args args = {
+            .n_rows = visible_rows, .n_head = 32, .head_dim = 128, .scale = 1.0f / 64.0f,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        const ds4_gpu_tensor *tensors[] = {q, weights, keys, scores, blocks};
+        for (NSUInteger i = 0; i < 5; i++)
+            [enc setBuffer:ds4_gpu_tensor_buffer(tensors[i]) offset:ds4_gpu_tensor_offset(tensors[i]) atIndex:i + 1];
+        [enc dispatchThreadgroups:MTLSizeMake(block_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 candidate block scores");
+    }
 }
 
 int ds4_gpu_dsv41_gather_kv_f16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
