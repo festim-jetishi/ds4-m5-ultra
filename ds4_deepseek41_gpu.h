@@ -194,7 +194,7 @@ int ds4_gpu_dsv41_stage_rows_tensor(
         ds4_gpu_tensor *const *windows, ds4_gpu_tensor *const *comps,
         const ds4_gpu_tensor *kv_rows, const ds4_gpu_tensor *sel, uint32_t sel_stride,
         const uint32_t *n_raw, const uint32_t *first_pos, const uint32_t *new_from,
-        const uint32_t *new_row0, const uint32_t *n_comp);
+        const uint32_t *new_row0, const uint32_t *n_comp, int comp_f16);
 int ds4_gpu_attention_rows_stage_tensor(uint32_t row, uint32_t n_rows,
                                         const ds4_gpu_tensor *raw_kv, uint32_t n_raw,
                                         uint32_t raw_cap, uint32_t raw_start,
@@ -214,7 +214,10 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  uint64_t weight_offset, uint32_t width,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in);
-/* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
+/* Gather 512-wide F32 or F16 KV rows; IDs must come from top-k over source_rows. */
+int ds4_gpu_dsv41_gather_kv_f16(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
+                               const ds4_gpu_tensor *ids, uint32_t source_rows,
+                               uint32_t selected_rows);
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);

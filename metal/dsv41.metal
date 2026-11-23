@@ -434,6 +434,7 @@ struct ds4_metal_args_dsv41_stage_rows {
     uint raw_cap;
     uint sel_stride;
     uint comp_direct;
+    uint comp_f16;
     uint n_raw[8];
     uint raw_start[8];
     uint first_pos[8];
@@ -489,6 +490,11 @@ kernel void kernel_dsv41_stage_rows_f16(
         device const char * c = r == 0 ? c0 : r == 1 ? c1 : r == 2 ? c2 : r == 3 ? c3 :
                                 r == 4 ? c4 : r == 5 ? c5 : r == 6 ? c6 : c7;
         const uint src = args.comp_direct ? i : (uint)sel[r * args.sel_stride + i];
+        if (args.comp_f16) {
+            ((device packed_half4 *)dst)[(r * args.n_keys + k) * 128u + col] =
+                ((device const packed_half4 *)c)[src * 128u + col];
+            return;
+        }
         value = float4(((device const packed_float4 *)c)[src * 128u + col]);
     }
     ((device packed_half4 *)dst)[(r * args.n_keys + k) * 128u + col] = packed_half4(half4(value));
