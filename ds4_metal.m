@@ -44707,13 +44707,14 @@ int ds4_gpu_routed_moe_batch_tensor(
             packed_header + packed_rows * packed_width * sizeof(uint16_t) <= packed_limit &&
             ds4_gpu_routed_mm_mpp_mask() == 7 &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K) ||
-             (g_tp_split_world == 2 && gate_type == DS4_METAL_TENSOR_MXFP4 &&
+             (g_test_flags == 0u && gate_type == DS4_METAL_TENSOR_MXFP4 &&
               down_type == DS4_METAL_TENSOR_MXFP4 &&
               getenv("DS4_METAL_DISABLE_MXFP4_MM_ID_MPP") == NULL)) &&
             getenv("DS4_METAL_DISABLE_ROUTED_MPP_PACKED") == NULL;
         const bool packed_m32n128 = use_packed_mpp && n_tokens >= 8192u &&
             n_total_expert == 384u && expert_in_dim == 5120u && expert_mid_dim == 2304u &&
-            gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K &&
+            ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K) ||
+             (gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4)) &&
             !getenv("DS4_METAL_DISABLE_V41_PACKED_M32N128");
         /* Tiny verification and session batches reuse the fused decode kernels.
          * V4.1 needs scalar reduction order before its BF16/router boundaries
@@ -44787,6 +44788,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          */
         const bool use_mm_id_pair_swiglu =
             use_mm_id &&
+            !use_packed_mpp &&
             !(gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
             g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
@@ -44994,11 +44996,11 @@ int ds4_gpu_routed_moe_batch_tensor(
             if (use_packed_mpp) {
                 gate_mm_pipeline = up_mm_pipeline =
                     ds4_gpu_get_pipeline(gate_type == DS4_METAL_TENSOR_MXFP4 ?
-                        "kernel_mul_mm_id_mxfp4_mpp_packed" : packed_m32n128 ?
-                        "kernel_mul_mm_id_iq2_xxs_mpp_packed_m32n128" : "kernel_mul_mm_id_iq2_xxs_mpp_packed");
+                        (packed_m32n128 ? "kernel_mul_mm_id_mxfp4_mpp_packed_m32n128" : "kernel_mul_mm_id_mxfp4_mpp_packed") :
+                        (packed_m32n128 ? "kernel_mul_mm_id_iq2_xxs_mpp_packed_m32n128" : "kernel_mul_mm_id_iq2_xxs_mpp_packed"));
                 down_mm_pipeline = ds4_gpu_get_pipeline(down_type == DS4_METAL_TENSOR_MXFP4 ?
-                        "kernel_mul_mm_id_mxfp4_mpp_packed" : packed_m32n128 ?
-                        "kernel_mul_mm_id_q2_K_mpp_packed_m32n128" : "kernel_mul_mm_id_q2_K_mpp_packed");
+                        (packed_m32n128 ? "kernel_mul_mm_id_mxfp4_mpp_packed_m32n128" : "kernel_mul_mm_id_mxfp4_mpp_packed") :
+                        (packed_m32n128 ? "kernel_mul_mm_id_q2_K_mpp_packed_m32n128" : "kernel_mul_mm_id_q2_K_mpp_packed"));
             }
             if (use_packed_mpp) mm_id_mpp_active = false;
             if (use_mm_id_pair_swiglu) {
