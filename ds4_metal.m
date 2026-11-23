@@ -21230,7 +21230,24 @@ static int ds4_gpu_matmul_f16_tensor_impl(
             const bool shared_rows = exact_rows && n_tok >= 2 && shared_rows_env &&
                 out_dim >= 32u &&
                 !strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4");
-            if (shared_rows) {
+            static const char *const f16_rows_1sg[9] = {
+                NULL, NULL,
+                "kernel_mul_mv_f16_f32_rows2_1sg", "kernel_mul_mv_f16_f32_rows3_1sg",
+                "kernel_mul_mv_f16_f32_rows4_1sg", "kernel_mul_mv_f16_f32_rows5_1sg",
+                "kernel_mul_mv_f16_f32_rows6_1sg", "kernel_mul_mv_f16_f32_rows7_1sg",
+                "kernel_mul_mv_f16_f32_rows8_1sg",
+            };
+            static int f16_1sg_env = -1;
+            if (f16_1sg_env < 0) f16_1sg_env = getenv("DS4_METAL_DISABLE_F16_1SG_ROWS") == NULL;
+            const bool use_f16_1sg = shared_rows && f16_1sg_env && !g_quality_mode &&
+                n_tok >= 2u && n_tok <= 8u && (in_dim & 3u) == 0 && (mv_args.nb11 & 15u) == 0;
+            if (use_f16_1sg) {
+                mv_dispatch.function_name = f16_rows_1sg[n_tok];
+                mv_dispatch.nsg = 4;
+                mv_dispatch.nr0 = 4;
+                mv_args.nr0 = 4;
+                mv_dispatch.smem = 0;
+            } else if (shared_rows) {
                 mv_dispatch.function_name = "kernel_mul_mv_f16_f32_4_rows";
                 mv_dispatch.nr0 = in_dim >= 8192u ? 4 : 2;
                 mv_args.nr0 = mv_dispatch.nr0;

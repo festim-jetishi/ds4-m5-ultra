@@ -1959,6 +1959,67 @@ kernel void kernel_mul_mv_f16_f32_4_rows(
     };
 }
 
+
+// 1 simdgroup = 1 output row (ZERO threadgroup memory, ZERO barriers, compile-time NR1).
+// Each lane loads 2x half4 (16 bytes = 8 halfs) once and dots against all NR1 activation rows.
+// Requires args.ne00 % 4 == 0 and args.nb11 % 16 == 0. Supports strided args.nb11 and args.ne0.
+template<short NR1>
+static inline void kernel_mul_mv_f16_f32_rows_1sg_r1_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const int r0 = (int)(tgpig.x * NSG + sgitg);
+    if (r0 >= args.ne01) return;
+
+    const int n4 = args.ne00 / 4;
+    device const half4 * ax0 = (device const half4 *)(src0 + (uint64_t)r0 * args.nb01);
+    const uint ystride = (uint)(args.nb11 / 16u);
+    device const float4 * yb4 = (device const float4 *)src1;
+
+    float s0[NR1];
+    FOR_UNROLL (short t = 0; t < NR1; ++t) {
+        s0[t] = 0.f;
+    }
+
+    int i = tiisg * 2;
+    for (; i + 1 < n4; i += 64) {
+        const float4 wa0 = float4(ax0[i]);
+        const float4 wb0 = float4(ax0[i + 1]);
+        FOR_UNROLL (short t = 0; t < NR1; ++t) {
+            device const float4 * yt = yb4 + (uint)t * ystride + i;
+            s0[t] += dot(wa0, yt[0]) + dot(wb0, yt[1]);
+        }
+    }
+    if (i < n4) {
+        const float4 wa0 = float4(ax0[i]);
+        FOR_UNROLL (short t = 0; t < NR1; ++t) {
+            s0[t] += dot(wa0, (yb4 + (uint)t * ystride)[i]);
+        }
+    }
+
+    FOR_UNROLL (short t = 0; t < NR1; ++t) {
+        const float tot = simd_sum(s0[t]);
+        if (tiisg == 0) {
+            ((device float *)dst)[(uint64_t)t * args.ne0 + r0] = tot;
+        }
+    }
+}
+
+#define DS4_F16_ROWS_1SG_KERNEL(R) [[host_name("kernel_mul_mv_f16_f32_rows" #R "_1sg")]] kernel void kernel_mul_mv_f16_f32_rows##R##_1sg(         constant ds4_metal_args_mul_mv & args,         device const char * src0,         device const char * src1,         device       char * dst,         uint3  tgpig [[threadgroup_position_in_grid]],         ushort tiisg [[thread_index_in_simdgroup]],         ushort sgitg [[simdgroup_index_in_threadgroup]]) {     kernel_mul_mv_f16_f32_rows_1sg_r1_impl<R>(args, src0, src1, dst, tgpig, tiisg, sgitg); }
+DS4_F16_ROWS_1SG_KERNEL(2)
+DS4_F16_ROWS_1SG_KERNEL(3)
+DS4_F16_ROWS_1SG_KERNEL(4)
+DS4_F16_ROWS_1SG_KERNEL(5)
+DS4_F16_ROWS_1SG_KERNEL(6)
+DS4_F16_ROWS_1SG_KERNEL(7)
+DS4_F16_ROWS_1SG_KERNEL(8)
+#undef DS4_F16_ROWS_1SG_KERNEL
+
 [[host_name("kernel_mul_mv_f32_f32_4_rows")]]
 kernel void kernel_mul_mv_f32_f32_4_rows(
         constant ds4_metal_args_mul_mv & args,
