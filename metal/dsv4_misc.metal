@@ -1641,6 +1641,9 @@ static inline float glm_cache_load_f32_or_f16(
         device const char *base,
         uint64_t index,
         uint cache_f16) {
+    if (cache_f16 == 2u) {
+        return as_type<float>((uint)((device const ushort *)base)[index] << 16u);
+    }
     if (cache_f16 != 0u) {
         return (float)((device const half *)base)[index];
     }
@@ -2071,6 +2074,10 @@ static inline float4 glm_indexer_cache_row4(
         ushort lane,
         uint cache_f16) {
     const uint64_t idx = (uint64_t)row * 128u + (uint64_t)lane * 4u;
+    if (cache_f16 == 2u) {
+        const ushort4 v = *(device const ushort4 *)((device const ushort *)indexer_key_cache + idx);
+        return as_type<float4>(uint4(v) << 16u);
+    }
     if (cache_f16 != 0u) {
         return float4(glm_cache_load_f32_or_f16(indexer_key_cache, idx + 0u, cache_f16),
                       glm_cache_load_f32_or_f16(indexer_key_cache, idx + 1u, cache_f16),

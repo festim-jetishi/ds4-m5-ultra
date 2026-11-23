@@ -61,6 +61,9 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
+int ds4_gpu_tensor_copy_f32_to_bf16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                    const ds4_gpu_tensor *src, uint64_t src_offset,
+                                    uint64_t count);
 int ds4_gpu_moe_handoff_pack_tensor(
         ds4_gpu_tensor       *packed,
         const ds4_gpu_tensor *ffn_norm,
@@ -1647,6 +1650,35 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
 int ds4_gpu_dsv41_indexer_score_blocks(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
         const ds4_gpu_tensor *blocks, uint32_t visible_rows, uint32_t block_count);
+int ds4_gpu_dsv41_indexer_score_blocks_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *blocks, uint32_t visible_rows, uint32_t block_count);
+int ds4_gpu_dsv41_indexer_score_one_bf16(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale);
+int ds4_gpu_dsv41_indexer_pack_bf16(ds4_gpu_tensor *packed,
+                                    const ds4_gpu_tensor *q, const ds4_gpu_tensor *keys,
+                                    uint32_t source_rows, uint32_t rows);
+int ds4_gpu_dsv41_indexer_scores_packed_bf16(ds4_gpu_tensor *scores,
+                                             const ds4_gpu_tensor *q,
+                                             const ds4_gpu_tensor *weights,
+                                             const ds4_gpu_tensor *keys,
+                                             const ds4_gpu_tensor *packed,
+                                             uint32_t source_rows, uint32_t rows,
+                                             uint32_t start, uint32_t ratio,
+                                             uint32_t packed_rows, uint32_t offset);
+int ds4_gpu_dsv41_indexer_scores_batch_bf16(ds4_gpu_tensor *scores,
+                                            const ds4_gpu_tensor *q,
+                                            const ds4_gpu_tensor *weights,
+                                            const ds4_gpu_tensor *keys,
+                                            uint32_t source_rows, uint32_t rows,
+                                            uint32_t start, uint32_t ratio);
 
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,

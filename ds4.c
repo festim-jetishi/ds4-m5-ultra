@@ -40974,6 +40974,7 @@ typedef struct {
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     bool comp_f16;               /* compressed KV rows stored as fp16 (exact) */
+    bool index_bf16;             /* indexer key cache rows stored as bf16 (bit-exact) */
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor *tp_logits_half;
     ds4_gpu_tensor **tp_out, **tp_in;
@@ -41155,6 +41156,18 @@ static bool ds41_comp_f16(void) {
 }
 static uint32_t ds41_comp_row_bytes(bool f16) { return 512u * (f16 ? 2u : 4u); }
 
+static bool ds41_index_bf16(void) {
+#ifdef __APPLE__
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_METAL_DISABLE_V41_INDEX_BF16") == NULL;
+    return v != 0;
+#else
+    return false;
+#endif
+}
+
+static uint32_t ds41_index_row_bytes(bool bf16) { return 128u * (bf16 ? 2u : 4u); }
+
 static uint64_t ds41_graph_bytes(uint32_t ctx) {
     const ds41_gpu_graph shape = {.ctx = ctx,
         .prefill_cap = ds41_prefill_limit(ctx),
@@ -41164,7 +41177,8 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     uint64_t floats = (uint64_t)40 * 128 * 512;
     for (uint32_t i = 0; i < 4; i++)
         floats += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) *
-                  (ds41_comp_row_bytes(ds41_comp_f16()) / 4u + 128u) + 2u * 512u;
+                  (ds41_comp_row_bytes(ds41_comp_f16()) / 4u +
+                   ds41_index_row_bytes(ds41_index_bf16()) / 4u) + 2u * 512u;
     floats += (uint64_t)2 * 2 * DS4_N_EMBD * DS4_N_HC;
     const uint64_t brk_kv = floats;
 #define DS41_COUNT(name, count) floats += (count);
@@ -41232,7 +41246,8 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
     m.raw_bytes = 40u * 128u * 512u * sizeof(float);
     for (uint32_t i = 0; i < 4; i++)
         m.compressed_bytes += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) *
-                              (ds41_comp_row_bytes(ds41_comp_f16()) + 128u * sizeof(float));
+                              (ds41_comp_row_bytes(ds41_comp_f16()) +
+                               ds41_index_row_bytes(ds41_index_bf16()));
     m.total_bytes = ds41_graph_bytes(ctx);
     m.scratch_bytes = m.total_bytes - m.raw_bytes - m.compressed_bytes;
     return m;
@@ -41731,6 +41746,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS");
     g->allocation_bytes = ds41_graph_bytes(ctx) - (ws ? ds41_graph_workspace_bytes(ctx) : 0);
     g->comp_f16 = ds41_comp_f16();
+    g->index_bf16 = ds41_index_bf16();
     g->workspace = ws;
     g->streaming = streaming;
     g->tp_world = 1;
@@ -41775,7 +41791,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
         g->compressed[i] = ds4_gpu_tensor_alloc(cap * ds41_comp_row_bytes(g->comp_f16));
-        g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(float));
+        g->index_cache[i] = ds4_gpu_tensor_alloc(cap * ds41_index_row_bytes(g->index_bf16));
         g->previous_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         g->previous_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] || !g->previous_score[i]) goto fail;
@@ -42228,6 +42244,18 @@ static bool ds41_comp_store(ds41_gpu_graph *g, uint32_t owner, uint32_t row,
                             src, 0, (uint64_t)rows * 512u * 4u);
 }
 
+static bool ds41_index_store(ds41_gpu_graph *g, uint32_t owner, uint32_t row,
+                             const ds4_gpu_tensor *src, uint32_t rows) {
+#ifdef __APPLE__
+    if (g->index_bf16) {
+        return ds4_gpu_tensor_copy_f32_to_bf16(g->index_cache[owner], (uint64_t)row * 128u * 2u,
+                                               src, 0, (uint64_t)rows * 128u);
+    }
+#endif
+    return ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)row * 128u * 4u,
+                               src, 0, (uint64_t)rows * 128u * 4u);
+}
+
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -42253,8 +42281,7 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                 !ds41_norm(g->index_k, g->index_k, m, l->indexer_k_norm) ||
                 !ds41_rope(g->index_k, 1, DS4_N_INDEXER_HEAD_DIM, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0) ||
-                !ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
-                                     g->index_k, 0, 128u * 4u) ||
+                !ds41_index_store(g, owner, n_comp - 1u, g->index_k, 1u) ||
                 !ds41_rope(g->latent, 1, 512, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
                 !ds41_comp_store(g, owner, n_comp - 1u, g->latent, 1)) return false;
@@ -42314,10 +42341,16 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
              !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true))) return false;
 #ifdef __APPLE__
         if (il > 20 && n_comp > 2048u * 8u && g->score_selected_blocks) {
-            if (!ds4_gpu_dsv41_indexer_score_blocks(g->index_scores, g->index_q, g->index_weights,
-                    g->index_cache[owner], g->block_selected, n_comp, 2048u)) return false;
-        } else if (!ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
+            if (!(g->index_bf16 ?
+                    ds4_gpu_dsv41_indexer_score_blocks_bf16(g->index_scores, g->index_q, g->index_weights,
+                        g->index_cache[owner], g->block_selected, n_comp, 2048u) :
+                    ds4_gpu_dsv41_indexer_score_blocks(g->index_scores, g->index_q, g->index_weights,
+                        g->index_cache[owner], g->block_selected, n_comp, 2048u))) return false;
+        } else if (!(g->index_bf16 ?
+                ds4_gpu_dsv41_indexer_score_one_bf16(g->index_scores, g->index_q, g->index_weights,
+                    g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f) :
+                ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+                    g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false))) return false;
 #else
         if (!ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
@@ -42822,8 +42855,7 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
         ds4_gpu_dsv41_rope_stride(b->index_k, DS4_N_INDEXER_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->index_k, DS4_N_INDEXER_HEAD_DIM, rows, DS4_V41_FP4_E8M0) &&
-        ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)first * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-            b->index_k, 0, (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float)) &&
+        ds41_index_store(g, owner, first, b->index_k, rows) &&
         ds4_gpu_dsv41_rope_stride(b->latent, DS4_N_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->latent, DS4_N_HEAD_DIM, rows, DS4_V41_FP4_E4M3) &&
@@ -42868,19 +42900,40 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
      * per-row causal width, including padding and tie order. */
     const bool packed = count >= 8u && ds4_gpu_dsv41_tensor_ops_available() &&
         !getenv("DS4_METAL_DISABLE_V41_PACKED_INDEX");
+#ifdef __APPLE__
+    if (packed && !(g->index_bf16 ?
+        ds4_gpu_dsv41_indexer_pack_bf16(g->index_packed, b->index_q, g->index_cache[owner], n_comp, count) :
+        ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q, g->index_cache[owner], n_comp, count)))
+        return false;
+#else
     if (packed && !ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q,
         g->index_cache[owner], n_comp, count)) return false;
+#endif
     for (uint32_t off = 0; off < count; off += DS41_INDEX_BATCH) {
         const uint32_t rows = count - off < DS41_INDEX_BATCH ? count - off : DS41_INDEX_BATCH;
         const uint64_t q_bytes = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         const uint64_t w_bytes = DS4_N_INDEXER_HEAD * sizeof(float);
         ds4_gpu_tensor *q = ds4_gpu_tensor_view(b->index_q, off * q_bytes, rows * q_bytes);
         ds4_gpu_tensor *weights = ds4_gpu_tensor_view(b->index_weights, off * w_bytes, rows * w_bytes);
+#ifdef __APPLE__
+        bool ok = q && weights && (packed ?
+            (g->index_bf16 ?
+                ds4_gpu_dsv41_indexer_scores_packed_bf16(g->index_scores, q, weights,
+                    g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
+                ds4_gpu_dsv41_indexer_scores_packed(g->index_scores, q, weights,
+                    g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off)) :
+            (g->index_bf16 ?
+                ds4_gpu_dsv41_indexer_scores_batch_bf16(g->index_scores,
+                    q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio) :
+                ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
+                    q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio)));
+#else
         bool ok = q && weights && (packed ?
             ds4_gpu_dsv41_indexer_scores_packed(g->index_scores, q, weights,
                 g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
             ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
                 q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio));
+#endif
         ds4_gpu_tensor_free(weights);
         ds4_gpu_tensor_free(q);
         const bool batch_topk = (start + off + 1u) / ratio >= 1024u &&
@@ -62937,9 +62990,20 @@ struct ds4_session {
         float prev_score[3][512];
         ds4_engram_history history;
         float *logits;
+        bool dspark_valid;
+        uint32_t dspark_positions[3][128];
+        uint16_t *dspark_target_bf16;
         uint64_t seq;
     } anchors[DS4_SESSION_MAX_ANCHORS];
     uint64_t anchor_seq;
+    /* Incremental 3-gram suffix index for zero-cost Prompt-Lookup hybrid drafting. */
+    struct {
+        uint32_t hash;
+        uint32_t pos[2];
+    } *pld_buckets;
+    int pld_indexed_len;
+    uint32_t pld_consecutive_misses;
+    uint32_t pld_skip;
     bool test_checkpoint;
 };
 
@@ -65062,6 +65126,7 @@ enum {
     DS41_SPAN_RAW = 0,
     DS41_SPAN_BF16 = 1,
     DS41_SPAN_COMP = 2,
+    DS41_SPAN_INDEX = 3,
 };
 
 typedef struct {
@@ -65070,14 +65135,29 @@ typedef struct {
     uint8_t kind;
 } ds41_state_span;
 
-#define DS41_PAYLOAD_TAG_F32     0x413431u
-#define DS41_PAYLOAD_TAG_F16     0x413432u
-#define DS41_PAYLOAD_TAG_COMPACT 0x413433u
+#define DS41_PAYLOAD_TAG_F32            0x413431u
+#define DS41_PAYLOAD_TAG_F16            0x413432u
+#define DS41_PAYLOAD_TAG_COMPACT        0x413433u
+#define DS41_PAYLOAD_TAG_COMPACT_DSPARK 0x413434u
+
+static bool ds41_dspark_ring_ready(const ds41_gpu_graph *g, uint32_t pos) {
+    if (!g || !g->dspark || !pos) return false;
+    const ds41_dspark *d = g->dspark;
+    const uint32_t start = pos > DS41_DRAFT_WINDOW ? pos - DS41_DRAFT_WINDOW : 0u;
+    for (uint32_t p = start; p < pos; p++) {
+        for (unsigned stage = 0; stage < 3u; stage++) {
+            if (d->positions[stage][p % DS41_DRAFT_WINDOW] != p) return false;
+        }
+    }
+    return true;
+}
 
 static uint32_t ds41_save_payload_tag(const ds41_gpu_graph *g) {
     if (!g || !g->comp_f16) return DS41_PAYLOAD_TAG_F32;
-    return getenv("DS4_V41_DISABLE_COMPACT_KV_DISK") ? DS41_PAYLOAD_TAG_F16
-                                                      : DS41_PAYLOAD_TAG_COMPACT;
+    if (getenv("DS4_V41_DISABLE_COMPACT_KV_DISK")) return DS41_PAYLOAD_TAG_F16;
+    if (!getenv("DS4_V41_DISABLE_DSPARK_KV_DISK") && ds41_dspark_ring_ready(g, g->pos))
+        return DS41_PAYLOAD_TAG_COMPACT_DSPARK;
+    return DS41_PAYLOAD_TAG_COMPACT;
 }
 
 /* The selection masks are rebuilt by each index-source layer on the next
@@ -65089,7 +65169,8 @@ static uint32_t ds41_state_spans_fmt(ds41_gpu_graph *g, uint32_t pos,
                                      ds41_state_span spans[54], uint32_t tag) {
     uint32_t n = 0;
     const bool comp_f16 = tag != DS41_PAYLOAD_TAG_F32;
-    const bool compact = tag == DS41_PAYLOAD_TAG_COMPACT;
+    const bool compact = tag == DS41_PAYLOAD_TAG_COMPACT ||
+                         tag == DS41_PAYLOAD_TAG_COMPACT_DSPARK;
     const uint32_t raw = pos < 128u ? pos : 128u;
     for (uint32_t il = 0; il < 40; il++)
         spans[n++] = (ds41_state_span){
@@ -65107,7 +65188,7 @@ static uint32_t ds41_state_spans_fmt(ds41_gpu_graph *g, uint32_t pos,
         spans[n++] = (ds41_state_span){
             g->index_cache[i],
             (uint64_t)live * 128u * (compact ? 2u : 4u),
-            compact ? DS41_SPAN_BF16 : DS41_SPAN_RAW
+            DS41_SPAN_INDEX
         };
         if (i < 3 && (pos & 1u)) {
             spans[n++] = (ds41_state_span){g->previous_kv[i], 512u * 4u, DS41_SPAN_RAW};
@@ -65117,11 +65198,18 @@ static uint32_t ds41_state_spans_fmt(ds41_gpu_graph *g, uint32_t pos,
     return n;
 }
 
+static uint64_t ds41_payload_dspark_bytes(uint32_t pos) {
+    const uint32_t raw = pos < DS41_DRAFT_WINDOW ? pos : DS41_DRAFT_WINDOW;
+    return (uint64_t)3u * DS41_DRAFT_WINDOW * sizeof(uint32_t) +
+           (uint64_t)3u * raw * DS4_N_EMBD * sizeof(uint16_t);
+}
+
 static uint64_t ds41_payload_body_bytes_fmt(ds41_gpu_graph *g, uint32_t pos, uint32_t tag) {
     ds41_state_span spans[54];
     const uint32_t n = ds41_state_spans_fmt(g, pos, spans, tag);
     uint64_t bytes = ((uint64_t)pos + DS4_N_VOCAB) * sizeof(float);
     for (uint32_t i = 0; i < n; i++) bytes += spans[i].bytes;
+    if (tag == DS41_PAYLOAD_TAG_COMPACT_DSPARK) bytes += ds41_payload_dspark_bytes(pos);
     return bytes;
 }
 
@@ -65150,13 +65238,57 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     ds41_state_span spans[54];
     const uint32_t n = ds41_state_spans_fmt(g, g->pos, spans, tag);
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    uint16_t *bf16_buf = tag == DS41_PAYLOAD_TAG_COMPACT ?
+    const bool file_compact_save = (tag == DS41_PAYLOAD_TAG_COMPACT ||
+                                    tag == DS41_PAYLOAD_TAG_COMPACT_DSPARK);
+    uint16_t *bf16_buf = file_compact_save ?
         xmalloc(DS4_SESSION_IO_CHUNK / 2u) : NULL;
     int rc = 0;
     for (uint32_t i = 0; i < n && !rc; i++) {
+        if (spans[i].kind == DS41_SPAN_INDEX) {
+            if (file_compact_save == g->index_bf16) {
+                /* Direct GPU-to-disk copy (zero conversion when both are BF16 or both FP32). */
+                rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
+                                                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                continue;
+            }
+            if (file_compact_save && !g->index_bf16) {
+                /* Device FP32 -> file BF16 */
+                const uint64_t total_elems = spans[i].bytes / 2u;
+                const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
+                for (uint64_t done = 0; done < total_elems && !rc; done += step) {
+                    const uint64_t k = total_elems - done < step ? total_elems - done : step;
+                    if (!ds4_gpu_tensor_read(spans[i].tensor, done * 4u, buf, k * 4u)) {
+                        payload_set_err(err, errlen, "V4.1 compact index read failed");
+                        rc = 1;
+                        break;
+                    }
+                    const uint32_t *src = (const uint32_t *)buf;
+                    for (uint64_t e = 0; e < k; e++) bf16_buf[e] = (uint16_t)(src[e] >> 16u);
+                    rc = payload_write_bytes(fp, bf16_buf, k * 2u, err, errlen);
+                }
+                continue;
+            }
+            /* Device BF16 -> legacy FP32 file (e.g. DS4_V41_DISABLE_COMPACT_KV_DISK) */
+            const uint64_t total_elems = spans[i].bytes / 4u;
+            const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
+            uint32_t *f32_tmp = xmalloc(DS4_SESSION_IO_CHUNK);
+            for (uint64_t done = 0; done < total_elems && !rc; done += step) {
+                const uint64_t k = total_elems - done < step ? total_elems - done : step;
+                if (!ds4_gpu_tensor_read(spans[i].tensor, done * 2u, buf, k * 2u)) {
+                    payload_set_err(err, errlen, "V4.1 legacy index read failed");
+                    rc = 1;
+                    break;
+                }
+                const uint16_t *src = (const uint16_t *)buf;
+                for (uint64_t e = 0; e < k; e++) f32_tmp[e] = (uint32_t)src[e] << 16u;
+                rc = payload_write_bytes(fp, f32_tmp, k * 4u, err, errlen);
+            }
+            free(f32_tmp);
+            continue;
+        }
         if (spans[i].kind != DS41_SPAN_BF16) {
             rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
-                                           buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
             continue;
         }
         const uint64_t total_elems = spans[i].bytes / 2u;
@@ -65164,13 +65296,33 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         for (uint64_t done = 0; done < total_elems && !rc; done += step) {
             const uint64_t k = total_elems - done < step ? total_elems - done : step;
             if (!ds4_gpu_tensor_read(spans[i].tensor, done * 4u, buf, k * 4u)) {
-                payload_set_err(err, errlen, "V4.1 compact snapshot tensor read failed");
+                payload_set_err(err, errlen, "V4.1 compact snapshot read failed");
                 rc = 1;
                 break;
             }
             const uint32_t *src = (const uint32_t *)buf;
             for (uint64_t e = 0; e < k; e++) bf16_buf[e] = (uint16_t)(src[e] >> 16u);
             rc = payload_write_bytes(fp, bf16_buf, k * 2u, err, errlen);
+        }
+    }
+    if (!rc && tag == DS41_PAYLOAD_TAG_COMPACT_DSPARK && g->dspark) {
+        const ds41_dspark *d = g->dspark;
+        const uint32_t raw = g->pos < DS41_DRAFT_WINDOW ? g->pos : DS41_DRAFT_WINDOW;
+        rc = payload_write_bytes(fp, d->positions, sizeof(d->positions), err, errlen);
+        const uint64_t stage_elems = (uint64_t)raw * DS4_N_EMBD;
+        const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
+        for (uint32_t stage = 0; stage < 3u && !rc; stage++) {
+            for (uint64_t done = 0; done < stage_elems && !rc; done += step) {
+                const uint64_t k = stage_elems - done < step ? stage_elems - done : step;
+                if (!ds4_gpu_tensor_read(d->target[stage], done * 4u, buf, k * 4u)) {
+                    payload_set_err(err, errlen, "V4.1 A44 DSpark feature read failed");
+                    rc = 1;
+                    break;
+                }
+                const uint32_t *src = (const uint32_t *)buf;
+                for (uint64_t e = 0; e < k; e++) bf16_buf[e] = (uint16_t)(src[e] >> 16u);
+                rc = payload_write_bytes(fp, bf16_buf, k * 2u, err, errlen);
+            }
         }
     }
     free(bf16_buf);
@@ -65187,7 +65339,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
         h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
         (tag != DS41_PAYLOAD_TAG_F32 && tag != DS41_PAYLOAD_TAG_F16 &&
-         tag != DS41_PAYLOAD_TAG_COMPACT) ||
+         tag != DS41_PAYLOAD_TAG_COMPACT && tag != DS41_PAYLOAD_TAG_COMPACT_DSPARK) ||
         remaining != ds41_payload_body_bytes_fmt(g, pos, tag)) {
         payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
         return 1;
@@ -65220,12 +65372,55 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         }
         t_logits = now_sec();
         const bool file_f16 = tag != DS41_PAYLOAD_TAG_F32;
+        const bool file_compact = (tag == DS41_PAYLOAD_TAG_COMPACT ||
+                                   tag == DS41_PAYLOAD_TAG_COMPACT_DSPARK);
         ds41_state_span spans[54];
         const uint32_t n = ds41_state_spans_fmt(g, pos, spans, tag);
         uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-        uint32_t *f32_buf = tag == DS41_PAYLOAD_TAG_COMPACT ?
-            xmalloc(DS4_SESSION_IO_CHUNK) : NULL;
+        uint32_t *f32_buf = file_compact ? xmalloc(DS4_SESSION_IO_CHUNK) : NULL;
         for (uint32_t i = 0; i < n && !rc; i++) {
+            if (spans[i].kind == DS41_SPAN_INDEX) {
+                if (file_compact == g->index_bf16) {
+                    /* Direct disk-to-GPU copy (zero conversion when formats match!). */
+                    rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
+                                                   buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                    continue;
+                }
+                if (file_compact && !g->index_bf16) {
+                    /* File BF16 -> device FP32 */
+                    const uint64_t total_elems = spans[i].bytes / 2u;
+                    const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
+                    for (uint64_t done = 0; done < total_elems && !rc; done += step) {
+                        const uint64_t k = total_elems - done < step ? total_elems - done : step;
+                        rc = payload_read_bytes(fp, buf, k * 2u, &remaining, err, errlen);
+                        if (rc) break;
+                        const uint16_t *src = (const uint16_t *)buf;
+                        for (uint64_t e = 0; e < k; e++) f32_buf[e] = (uint32_t)src[e] << 16u;
+                        if (!ds4_gpu_tensor_write(spans[i].tensor, done * 4u, f32_buf, k * 4u)) {
+                            payload_set_err(err, errlen, "V4.1 compact index restore failed");
+                            rc = 1;
+                        }
+                    }
+                    continue;
+                }
+                /* Legacy A41/A42 FP32 file -> device BF16 (exact top 16 bits!) */
+                const uint64_t total_elems = spans[i].bytes / 4u;
+                const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
+                uint16_t *bf16_tmp = xmalloc(DS4_SESSION_IO_CHUNK / 2u);
+                for (uint64_t done = 0; done < total_elems && !rc; done += step) {
+                    const uint64_t k = total_elems - done < step ? total_elems - done : step;
+                    rc = payload_read_bytes(fp, buf, k * 4u, &remaining, err, errlen);
+                    if (rc) break;
+                    const uint32_t *src = (const uint32_t *)buf;
+                    for (uint64_t e = 0; e < k; e++) bf16_tmp[e] = (uint16_t)(src[e] >> 16u);
+                    if (!ds4_gpu_tensor_write(spans[i].tensor, done * 2u, bf16_tmp, k * 2u)) {
+                        payload_set_err(err, errlen, "V4.1 legacy index bf16 restore failed");
+                        rc = 1;
+                    }
+                }
+                free(bf16_tmp);
+                continue;
+            }
             if (spans[i].kind == DS41_SPAN_BF16) {
                 const uint64_t total_elems = spans[i].bytes / 2u;
                 const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
@@ -65266,10 +65461,42 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             }
             free(out);
         }
+        bool loaded_dspark_ring = false;
+        uint32_t loaded_dspark_pos[3][DS41_DRAFT_WINDOW];
+        if (!rc && tag == DS41_PAYLOAD_TAG_COMPACT_DSPARK) {
+            const uint32_t raw = pos < DS41_DRAFT_WINDOW ? pos : DS41_DRAFT_WINDOW;
+            rc = payload_read_bytes(fp, loaded_dspark_pos, sizeof(loaded_dspark_pos),
+                                    &remaining, err, errlen);
+            const uint64_t stage_elems = (uint64_t)raw * DS4_N_EMBD;
+            const uint64_t step = DS4_SESSION_IO_CHUNK / 4u;
+            for (uint32_t stage = 0; stage < 3u && !rc; stage++) {
+                for (uint64_t done = 0; done < stage_elems && !rc; done += step) {
+                    const uint64_t k = stage_elems - done < step ? stage_elems - done : step;
+                    rc = payload_read_bytes(fp, buf, k * 2u, &remaining, err, errlen);
+                    if (rc) break;
+                    if (g->dspark) {
+                        const uint16_t *src = (const uint16_t *)buf;
+                        for (uint64_t e = 0; e < k; e++) f32_buf[e] = (uint32_t)src[e] << 16u;
+                        if (!ds4_gpu_tensor_write(g->dspark->target[stage], done * 4u, f32_buf, k * 4u)) {
+                            payload_set_err(err, errlen, "V4.1 A44 DSpark restore failed");
+                            rc = 1;
+                        }
+                    }
+                }
+            }
+            if (!rc && g->dspark) loaded_dspark_ring = true;
+        }
         free(f32_buf);
         free(buf);
         if (!rc) {
             ds41_graph_reset(g);
+            if (loaded_dspark_ring && g->dspark) {
+                memcpy(g->dspark->positions, loaded_dspark_pos, sizeof(loaded_dspark_pos));
+            }
+            s->pld_indexed_len = 0;
+            s->pld_consecutive_misses = 0;
+            s->pld_skip = 0;
+            if (s->pld_buckets) memset(s->pld_buckets, 0, (size_t)65536u * sizeof(*s->pld_buckets));
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
@@ -87952,6 +88179,136 @@ int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
     return 0;
 }
 #endif
+#define DS4_PLD_BUCKETS 65536u
+#define DS4_PLD_MASK    (DS4_PLD_BUCKETS - 1u)
+
+static inline uint32_t ds4_pld_hash3(int a, int b, int c) {
+    uint32_t h = (uint32_t)a * 2654435761u;
+    h ^= (uint32_t)b * 2246822519u;
+    h = (h << 13) | (h >> 19);
+    h ^= (uint32_t)c * 3266489917u;
+    h ^= h >> 16;
+    h *= 2246822519u;
+    h ^= h >> 13;
+    return h ? h : 1u;
+}
+
+static void ds4_pld_update_index(ds4_session *s) {
+    if (!s || s->checkpoint.len < 4) return;
+    if (!s->pld_buckets) {
+        s->pld_buckets = xcalloc(DS4_PLD_BUCKETS, sizeof(*s->pld_buckets));
+        s->pld_indexed_len = 0;
+    }
+    if (s->pld_indexed_len > s->checkpoint.len) s->pld_indexed_len = 0;
+    int start = s->pld_indexed_len;
+    if (start < 2) start = 2;
+    const int *v = s->checkpoint.v;
+    const int n = s->checkpoint.len;
+    for (int i = start; i < n; i++) {
+        const uint32_t h = ds4_pld_hash3(v[i - 2], v[i - 1], v[i]);
+        uint32_t slot = h & DS4_PLD_MASK;
+        if (s->pld_buckets[slot].hash == h) {
+            if (s->pld_buckets[slot].pos[0] != (uint32_t)i) {
+                s->pld_buckets[slot].pos[1] = s->pld_buckets[slot].pos[0];
+                s->pld_buckets[slot].pos[0] = (uint32_t)i;
+            }
+        } else {
+            s->pld_buckets[slot].hash = h;
+            s->pld_buckets[slot].pos[0] = (uint32_t)i;
+            s->pld_buckets[slot].pos[1] = 0;
+        }
+    }
+    s->pld_indexed_len = n;
+}
+
+/* Zero-GPU-cost suffix-ngram prompt lookup over s->checkpoint[0..L-1].
+ * Matches tail[tail_len-1] == first/last drafted token backwards up to 8 tokens
+ * and returns number of continuation tokens written to out[0..max_draft-1]. */
+static uint32_t ds4_pld_propose_from_tail(ds4_session *s, const int *tail, int tail_len,
+                                          uint32_t max_draft, int min_match,
+                                          int eos, bool ignore_eos, ds4_think_mode think_mode,
+                                          int *out) {
+    if (!s || !s->pld_buckets || tail_len < 3 || max_draft == 0 || s->checkpoint.len < 8)
+        return 0;
+    const int *v = s->checkpoint.v;
+    const int L = s->checkpoint.len;
+    const int a = tail[tail_len - 3], b = tail[tail_len - 2], c = tail[tail_len - 1];
+    const uint32_t h = ds4_pld_hash3(a, b, c);
+    const uint32_t slot = h & DS4_PLD_MASK;
+    if (s->pld_buckets[slot].hash != h) return 0;
+
+    int best_pos = -1;
+    int best_mlen = 0;
+    for (int ci = 0; ci < 2; ci++) {
+        const int p = (int)s->pld_buckets[slot].pos[ci];
+        if (p < 2 || p >= L - 1) continue;
+        if (v[p] != c || v[p - 1] != b || v[p - 2] != a) continue;
+        int mlen = 3;
+        while (mlen < tail_len && mlen < 12 && p - mlen >= 0 &&
+               v[p - mlen] == tail[tail_len - 1 - mlen]) {
+            mlen++;
+        }
+        if (mlen >= min_match && mlen > best_mlen) {
+            best_mlen = mlen;
+            best_pos = p;
+        }
+    }
+    if (best_pos < 0) return 0;
+
+    ds4_engine *e = s->engine;
+    uint32_t n = 0;
+    for (; n < max_draft && best_pos + 1 + (int)n < L; n++) {
+        const int tok = v[best_pos + 1 + (int)n];
+        if (tok < 0 || tok >= (int)DS4_N_VOCAB) break;
+        if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tok, think_mode)) break;
+        out[n] = tok;
+        if (tok == eos) { n++; break; }
+    }
+    return n;
+}
+
+static bool ds4_token_wakes_dspark(ds4_engine *e, int token) {
+    if (!e || token < 0 || token >= (int)e->vocab.n_vocab) return false;
+    const ds4_str s = e->vocab.token[token];
+    if (!s.ptr || s.len == 0) return false;
+    if (s.len >= 8 && memcmp(s.ptr, "</think>", 8) == 0) return true;
+    if (s.len >= 3 && memcmp(s.ptr, "```", 3) == 0) return true;
+    for (size_t i = 0; i < s.len; i++) {
+        const char ch = s.ptr[i];
+        if (ch == '{' || ch == '}' || ch == ';' || ch == ':') return true;
+    }
+    return false;
+}
+
+/* Exact target sampling residual when a deterministic PLD proposal tok (q=1)
+ * is rejected: samples from p(x | x != tok) = p(x) / (1 - p(tok)). */
+static int sample_pld_exact_residual(const sample_sparse_dist *p_sparse,
+                                     float *p_dense, int rejected_tok, uint64_t *rng) {
+    if (p_sparse && p_sparse->count > 0) {
+        sample_sparse_dist rem = *p_sparse;
+        float sum = 0.0f;
+        for (uint32_t j = 0; j < rem.count; j++) {
+            if (rem.ids[j] == rejected_tok) rem.probs[j] = 0.0f;
+            sum += rem.probs[j];
+        }
+        if (sum > 0.0f) {
+            const float inv = 1.0f / sum;
+            for (uint32_t j = 0; j < rem.count; j++) rem.probs[j] *= inv;
+            return sample_sparse_draw(&rem, rng);
+        }
+        return rejected_tok;
+    }
+    if (rejected_tok >= 0 && rejected_tok < (int)DS4_N_VOCAB) p_dense[rejected_tok] = 0.0f;
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < (uint32_t)DS4_N_VOCAB; j++) sum += p_dense[j];
+    if (sum > 0.0f) {
+        const float inv = 1.0f / sum;
+        for (uint32_t j = 0; j < (uint32_t)DS4_N_VOCAB; j++) p_dense[j] *= inv;
+        return sample_probabilities(p_dense, DS4_N_VOCAB, rng);
+    }
+    return rejected_tok;
+}
+
 static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int eos,
         bool ignore_eos, ds4_think_mode think_mode, float temperature, int top_k,
         float top_p, float min_p, uint64_t *rng, int *accepted, char *err, size_t errlen) {
@@ -87972,136 +88329,194 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     if (draft_cap && draft_cap < (uint32_t)cap - 1u) cap = (int)draft_cap + 1;
     const bool stats = ds4_dspark_stats_enabled();
     if (stats) { s->dspark_stats.cycles++; s->dspark_stats.first_tokens++; }
-    bool ready = d && !e->quality && !e->dspark_strict && cap > 1 &&
-        first_token != eos && g->pos && g->pos <= 1048576u - DS41_DRAFT_ROWS &&
-        ds41_tp_batch_enabled(g);
-    /* Old session files contain target caches, not draft features. Warm the
-     * window with ordinary decoding instead of inventing missing features. */
-    if (ready) for (uint32_t pos = g->pos > 128u ? g->pos - 128u : 0; pos < g->pos; pos++)
-        for (unsigned stage = 0; stage < 3; stage++)
-            ready = ready && d->positions[stage][pos % 128u] == pos;
-    if (!ready) {
-        if (stats) s->dspark_stats.no_draft++;
-        if (ds4_session_eval(s, first_token, err, errlen)) return -1;
-        accepted[0] = first_token;
-        return 1;
-    }
-    /* A draft costs about a quarter of a decode step even when its confidence
-     * then proposes nothing (common in prose). After empty drafts, decode
-     * normally for a while: 2, 4, 8, then 16 tokens until a draft is proposed. */
-    const bool backoff = !getenv("DS4_DSPARK_DISABLE_V41_BACKOFF");
-    if (backoff && s->dspark_sched_skip) {
-        s->dspark_sched_skip--;
-        if (stats) s->dspark_stats.scheduler_skips++;
-        if (ds4_session_eval(s, first_token, err, errlen)) return -1;
-        accepted[0] = first_token;
-        return 1;
-    }
+
     const bool exact = temperature > 0 && e->dspark_exact_sampling;
-    const double started = now_sec();
-#ifdef __APPLE__
-    const bool fast_markov = exact && !getenv("DS4_METAL_DISABLE_DSPARK_FAST_MARKOV");
-#else
-    const bool fast_markov = false;
-#endif
-    if (!ds41_session_draft_ex(s, first_token, fast_markov))
-        goto fail;
+    const bool pld_enabled = d && !e->quality && !e->dspark_strict && cap > 1 &&
+        first_token != eos && g->pos >= 16u && g->pos <= 1048576u - DS41_VERIFY_ROWS &&
+        ds41_tp_batch_enabled(g) && !getenv("DS4_PLD_DISABLE");
+    if (pld_enabled) ds4_pld_update_index(s);
+
     int tokens[DS41_VERIFY_ROWS] = {first_token};
+    bool row_is_pld[DS41_VERIFY_ROWS] = {false};
     uint32_t count = 1;
-    int chain = -1;
-    if (!exact) {
-        /* argmax drafts: the whole Markov chain on the GPU, one sync; the
-         * stopping rules below then apply to its rows in order */
-        int chained[DS41_DRAFT_ROWS];
-        float conf[DS41_DRAFT_ROWS];
-        chain = ds41_dspark_markov_chain(d, &e->mtp_model, (uint32_t)cap - 1u, first_token,
-                                         chained, conf);
-        if (chain == 0) goto fail;
-        for (; chain > 0 && count < (uint32_t)cap; count++) {
+    bool pure_pld_used = false;
+    const double started = now_sec();
+
+    /* Fast-path 1: Zero-GPU-cost Prompt-Lookup drafting.
+     * Require a high-precision exact suffix match (>=6 tokens by default, or
+     * >=4 when DSpark is sleeping/cold) so common 4-gram boilerplate in large
+     * 44K+ codebases never steals turns from DSpark's learned drafter. */
+    const bool dspark_sleeping = !getenv("DS4_DSPARK_DISABLE_V41_BACKOFF") && s->dspark_sched_skip > 0;
+    const int pld_min_match = (int)ds4_dspark_env_u32("DS4_PLD_MIN_MATCH", dspark_sleeping ? 4u : 6u);
+    if (pld_enabled) {
+        if (s->pld_skip > 0) {
+            s->pld_skip--;
+        } else {
+            int tail[12];
+            int tlen = 0;
+            const int take = s->checkpoint.len < 11 ? s->checkpoint.len : 11;
+            for (int k = s->checkpoint.len - take; k < s->checkpoint.len; k++)
+                tail[tlen++] = s->checkpoint.v[k];
+            tail[tlen++] = first_token;
+            const uint32_t n_pld = ds4_pld_propose_from_tail(
+                s, tail, tlen, (uint32_t)cap - 1u, pld_min_match, eos, ignore_eos, think_mode, tokens + 1);
+            if (n_pld >= 3u || (dspark_sleeping && n_pld >= 2u)) {
+                for (uint32_t r = 0; r < n_pld; r++) row_is_pld[r] = true;
+                count = 1u + n_pld;
+                pure_pld_used = true;
+            }
+        }
+    }
+
+    sample_sparse_dist draft_sparse[DS41_DRAFT_ROWS];
+    for (uint32_t r = 0; r < DS41_DRAFT_ROWS; r++) draft_sparse[r].count = 0;
+
+    const bool backoff = !getenv("DS4_DSPARK_DISABLE_V41_BACKOFF");
+    if (!pure_pld_used) {
+        bool ready = d && !e->quality && !e->dspark_strict && cap > 1 &&
+            first_token != eos && g->pos && g->pos <= 1048576u - DS41_DRAFT_ROWS &&
+            ds41_tp_batch_enabled(g);
+        if (ready) for (uint32_t pos = g->pos > 128u ? g->pos - 128u : 0; pos < g->pos; pos++)
+            for (unsigned stage = 0; stage < 3; stage++)
+                ready = ready && d->positions[stage][pos % 128u] == pos;
+        if (!ready) {
+            if (stats) s->dspark_stats.no_draft++;
+            if (ds4_session_eval(s, first_token, err, errlen)) return -1;
+            accepted[0] = first_token;
+            return 1;
+        }
+        /* Wake DSpark immediately on </think> or code-structure transitions. */
+        if (backoff && s->dspark_sched_skip) {
+            if (ds4_token_wakes_dspark(e, first_token)) {
+                s->dspark_sched_skip = 0;
+                s->ds41_empty_drafts = 0;
+            } else {
+                s->dspark_sched_skip--;
+                if (stats) s->dspark_stats.scheduler_skips++;
+                if (ds4_session_eval(s, first_token, err, errlen)) return -1;
+                accepted[0] = first_token;
+                return 1;
+            }
+        }
+#ifdef __APPLE__
+        const bool fast_markov = exact && !getenv("DS4_METAL_DISABLE_DSPARK_FAST_MARKOV");
+#else
+        const bool fast_markov = false;
+#endif
+        if (!ds41_session_draft_ex(s, first_token, fast_markov))
+            goto fail;
+        const uint32_t dspark_cap = (uint32_t)cap < DS41_DRAFT_ROWS + 1u ?
+                                    (uint32_t)cap : DS41_DRAFT_ROWS + 1u;
+        int chain = -1;
+        if (!exact) {
+            int chained[DS41_DRAFT_ROWS];
+            float conf[DS41_DRAFT_ROWS];
+            chain = ds41_dspark_markov_chain(d, &e->mtp_model, dspark_cap - 1u, first_token,
+                                             chained, conf);
+            if (chain == 0) goto fail;
+            for (; chain > 0 && count < dspark_cap; count++) {
+                const uint32_t row = count - 1u;
+                if (e->dspark_confidence_threshold > 0 &&
+                    sigmoid_stable(conf[row]) < e->dspark_confidence_threshold) break;
+                tokens[count] = chained[row];
+                if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
+                if (tokens[count] == eos) { count++; break; }
+            }
+        }
+        for (; chain < 0 && count < dspark_cap; count++) {
             const uint32_t row = count - 1u;
-            if (e->dspark_confidence_threshold > 0 &&
-                sigmoid_stable(conf[row]) < e->dspark_confidence_threshold) break;
-            tokens[count] = chained[row];
+            float confidence;
+            const float *qlogits = NULL;
+#ifdef __APPLE__
+            if (fast_markov) {
+                float emb[256];
+                if (!ds41_dspark_markov_confidence_cpu(d, &e->mtp_model, row, tokens[row], emb, &confidence))
+                    goto fail;
+                if (e->dspark_confidence_threshold > 0 &&
+                    sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
+                if (!ds41_dspark_markov_add_logits_only(d, &e->mtp_model, row, emb))
+                    goto fail;
+                const uint32_t dv = d->draft_logits_vocab ? d->draft_logits_vocab : DS4_N_VOCAB;
+                const float *shared_logits = (const float *)ds4_gpu_tensor_contents(d->logits);
+                if (!shared_logits) goto fail;
+                qlogits = shared_logits + (uint64_t)row * dv;
+            } else
+#endif
+            {
+                if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
+                if (e->dspark_confidence_threshold > 0 &&
+                    sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
+                qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
+            }
+#ifdef __APPLE__
+            const uint32_t dv = fast_markov && d->draft_logits_vocab ? d->draft_logits_vocab : DS4_N_VOCAB;
+            const bool dv_pruned = (dv != DS4_N_VOCAB) && g_ds41_bf16_narrow.draft_local_to_full != NULL;
+#else
+            const uint32_t dv = DS4_N_VOCAB;
+            const bool dv_pruned = false;
+#endif
+            if (exact) {
+                float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
+                if (!rng || !sample_build_probabilities_ex(qlogits, dv,
+                    temperature, top_k, top_p, min_p, q, &draft_sparse[row])) goto fail;
+                if (draft_sparse[row].count > 0) {
+#ifdef __APPLE__
+                    if (dv_pruned) {
+                        const uint32_t *l2f = g_ds41_bf16_narrow.draft_local_to_full;
+                        for (uint32_t si = 0; si < draft_sparse[row].count; si++)
+                            draft_sparse[row].ids[si] = (int)l2f[(uint32_t)draft_sparse[row].ids[si]];
+                    }
+#endif
+                    tokens[count] = sample_sparse_draw(&draft_sparse[row], rng);
+                } else {
+#ifdef __APPLE__
+                    if (dv_pruned) {
+                        const uint32_t *l2f = g_ds41_bf16_narrow.draft_local_to_full;
+                        memcpy(s->sample_probs, q, (size_t)dv * sizeof(float));
+                        memset(q, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+                        for (uint32_t si = 0; si < dv; si++) q[l2f[si]] = s->sample_probs[si];
+                    }
+#endif
+                    tokens[count] = sample_probabilities(q, DS4_N_VOCAB, rng);
+                }
+            } else {
+                const int best_local = sample_argmax(qlogits, dv);
+#ifdef __APPLE__
+                tokens[count] = dv_pruned ? (int)g_ds41_bf16_narrow.draft_local_to_full[(uint32_t)best_local] : best_local;
+#else
+                tokens[count] = best_local;
+#endif
+            }
             if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
             if (tokens[count] == eos) { count++; break; }
         }
-    }
-    sample_sparse_dist draft_sparse[DS41_DRAFT_ROWS];
-    for (uint32_t r = 0; r < DS41_DRAFT_ROWS; r++) draft_sparse[r].count = 0;
-    for (; chain < 0 && count < (uint32_t)cap; count++) {
-        const uint32_t row = count - 1u;
-        float confidence;
-        const float *qlogits = NULL;
-#ifdef __APPLE__
-        if (fast_markov) {
-            float emb[256];
-            if (!ds41_dspark_markov_confidence_cpu(d, &e->mtp_model, row, tokens[row], emb, &confidence))
-                goto fail;
-            if (e->dspark_confidence_threshold > 0 &&
-                sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
-            if (!ds41_dspark_markov_add_logits_only(d, &e->mtp_model, row, emb))
-                goto fail;
-            const uint32_t dv = d->draft_logits_vocab ? d->draft_logits_vocab : DS4_N_VOCAB;
-            const float *shared_logits = (const float *)ds4_gpu_tensor_contents(d->logits);
-            if (!shared_logits) goto fail;
-            qlogits = shared_logits + (uint64_t)row * dv;
-        } else
-#endif
-        {
-            if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
-            if (e->dspark_confidence_threshold > 0 &&
-                sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
-            qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
+        /* Fast-path 2 (Hybrid): when DSpark fills all 5 high-confidence draft
+         * slots and hasn't hit EOS, extend rows 6..7 for free from context! */
+        if (pld_enabled && count == DS41_DRAFT_ROWS + 1u && count < (uint32_t)cap &&
+            tokens[count - 1u] != eos) {
+            int tail[12];
+            int tlen = 0;
+            const int prev_take = s->checkpoint.len < 4 ? s->checkpoint.len : 4;
+            for (int k = s->checkpoint.len - prev_take; k < s->checkpoint.len; k++)
+                tail[tlen++] = s->checkpoint.v[k];
+            for (uint32_t k = 0; k < count && tlen < 12; k++)
+                tail[tlen++] = tokens[k];
+            const uint32_t ext = ds4_pld_propose_from_tail(
+                s, tail, tlen, (uint32_t)cap - count, 4, eos, ignore_eos, think_mode,
+                tokens + count);
+            for (uint32_t r = 0; r < ext; r++) row_is_pld[count - 1u + r] = true;
+            count += ext;
         }
-#ifdef __APPLE__
-        const uint32_t dv = fast_markov && d->draft_logits_vocab ? d->draft_logits_vocab : DS4_N_VOCAB;
-        const bool dv_pruned = (dv != DS4_N_VOCAB) && g_ds41_bf16_narrow.draft_local_to_full != NULL;
-#else
-        const uint32_t dv = DS4_N_VOCAB;
-        const bool dv_pruned = false;
-#endif
-        if (exact) {
-            float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
-            if (!rng || !sample_build_probabilities_ex(qlogits, dv,
-                temperature, top_k, top_p, min_p, q, &draft_sparse[row])) goto fail;
-            if (draft_sparse[row].count > 0) {
-#ifdef __APPLE__
-                if (dv_pruned) {
-                    const uint32_t *l2f = g_ds41_bf16_narrow.draft_local_to_full;
-                    for (uint32_t si = 0; si < draft_sparse[row].count; si++)
-                        draft_sparse[row].ids[si] = (int)l2f[(uint32_t)draft_sparse[row].ids[si]];
-                }
-#endif
-                tokens[count] = sample_sparse_draw(&draft_sparse[row], rng);
-            } else {
-#ifdef __APPLE__
-                if (dv_pruned) {
-                    const uint32_t *l2f = g_ds41_bf16_narrow.draft_local_to_full;
-                    memcpy(s->sample_probs, q, (size_t)dv * sizeof(float));
-                    memset(q, 0, (size_t)DS4_N_VOCAB * sizeof(float));
-                    for (uint32_t si = 0; si < dv; si++) q[l2f[si]] = s->sample_probs[si];
-                }
-#endif
-                tokens[count] = sample_probabilities(q, DS4_N_VOCAB, rng);
-            }
-        } else {
-            const int best_local = sample_argmax(qlogits, dv);
-#ifdef __APPLE__
-            tokens[count] = dv_pruned ? (int)g_ds41_bf16_narrow.draft_local_to_full[(uint32_t)best_local] : best_local;
-#else
-            tokens[count] = best_local;
-#endif
-        }
-        if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
-        if (tokens[count] == eos) { count++; break; }
     }
+
     if (count == 1) {
         if (stats) {
             s->dspark_stats.no_draft++;
             s->dspark_stats.propose_ms += (now_sec() - started) * 1000;
         }
         if (backoff && ++s->ds41_empty_drafts >= 2u) {
-            const uint32_t shift = s->ds41_empty_drafts - 1u < 4u ? s->ds41_empty_drafts - 1u : 4u;
+            /* Cap backoff at 4 tokens (was 16) so code/symbol transitions recover fast. */
+            const uint32_t shift = s->ds41_empty_drafts - 1u < 2u ? s->ds41_empty_drafts - 1u : 2u;
             s->dspark_sched_skip = 1u << shift;
         }
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
@@ -88113,7 +88528,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         snprintf(err, errlen, "interrupted");
         return -DS4_SESSION_SYNC_INTERRUPTED;
     }
-    s->ds41_empty_drafts = 0;
+    if (!pure_pld_used) s->ds41_empty_drafts = 0;
     const double proposed = now_sec();
     if (stats) {
         s->dspark_stats.propose_ms += (proposed - started) * 1000;
@@ -88129,33 +88544,51 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             if (sample_argmax(p_logits, DS4_N_VOCAB) != tokens[keep]) break;
         } else {
             const uint32_t row = keep - 1u;
-            float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
             sample_sparse_dist p_sparse;
             if (!sample_build_probabilities_ex(p_logits, DS4_N_VOCAB,
                 temperature, top_k, top_p, min_p, s->sample_probs, &p_sparse)) goto fail;
             const int token = tokens[keep];
-            const float q_tok = draft_sparse[row].count > 0 ?
-                sample_sparse_lookup(&draft_sparse[row], token) : q[token];
             const float p_tok = p_sparse.count > 0 ?
                 sample_sparse_lookup(&p_sparse, token) : s->sample_probs[token];
-            if (sample_rng_f32(rng) * q_tok > p_tok) {
-                if (p_sparse.count > 0 && draft_sparse[row].count > 0) {
-                    correction = sample_sparse_residual(&p_sparse, &draft_sparse[row], rng);
-                } else {
-                    if (p_sparse.count > 0) {
-                        memset(s->sample_probs, 0, (size_t)DS4_N_VOCAB * sizeof(float));
-                        for (uint32_t j = 0; j < p_sparse.count; j++)
-                            s->sample_probs[p_sparse.ids[j]] = p_sparse.probs[j];
-                    }
-                    if (draft_sparse[row].count > 0) {
-                        memset(q, 0, (size_t)DS4_N_VOCAB * sizeof(float));
-                        for (uint32_t j = 0; j < draft_sparse[row].count; j++)
-                            q[draft_sparse[row].ids[j]] = draft_sparse[row].probs[j];
-                    }
-                    correction = sample_residual_probabilities(s->sample_probs, q, DS4_N_VOCAB, rng);
+            if (row_is_pld[row]) {
+                /* Deterministic point-mass proposal (q=1): accept with prob p(tok),
+                 * else sample exact residual p(x | x != tok). 100% lossless! */
+                if (sample_rng_f32(rng) > p_tok) {
+                    correction = sample_pld_exact_residual(&p_sparse, s->sample_probs, token, rng);
+                    break;
                 }
-                break;
+            } else {
+                float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
+                const float q_tok = draft_sparse[row].count > 0 ?
+                    sample_sparse_lookup(&draft_sparse[row], token) : q[token];
+                if (sample_rng_f32(rng) * q_tok > p_tok) {
+                    if (p_sparse.count > 0 && draft_sparse[row].count > 0) {
+                        correction = sample_sparse_residual(&p_sparse, &draft_sparse[row], rng);
+                    } else {
+                        if (p_sparse.count > 0) {
+                            memset(s->sample_probs, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+                            for (uint32_t j = 0; j < p_sparse.count; j++)
+                                s->sample_probs[p_sparse.ids[j]] = p_sparse.probs[j];
+                        }
+                        if (draft_sparse[row].count > 0) {
+                            memset(q, 0, (size_t)DS4_N_VOCAB * sizeof(float));
+                            for (uint32_t j = 0; j < draft_sparse[row].count; j++)
+                                q[draft_sparse[row].ids[j]] = draft_sparse[row].probs[j];
+                        }
+                        correction = sample_residual_probabilities(s->sample_probs, q, DS4_N_VOCAB, rng);
+                    }
+                    break;
+                }
             }
+        }
+    }
+    if (pure_pld_used) {
+        if (keep > 1u) {
+            s->pld_consecutive_misses = 0;
+        } else {
+            s->pld_consecutive_misses++;
+            const uint32_t sh = s->pld_consecutive_misses < 4u ? s->pld_consecutive_misses : 4u;
+            s->pld_skip = 1u << sh;
         }
     }
     if (!ds41_session_commit(s, tokens, count, keep)) goto fail;
@@ -89422,6 +89855,10 @@ void ds4_session_invalidate(ds4_session *s) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
     }
     ds4_session_clear_anchors(s);
+    s->pld_indexed_len = 0;
+    s->pld_consecutive_misses = 0;
+    s->pld_skip = 0;
+    if (s->pld_buckets) memset(s->pld_buckets, 0, (size_t)65536u * sizeof(*s->pld_buckets));
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
@@ -89681,6 +90118,7 @@ void ds4_session_clear_anchors(ds4_session *s) {
         s->anchors[i].raw_rows = 0;
         s->anchors[i].token_hash = 0;
         s->anchors[i].image_count = 0;
+        s->anchors[i].dspark_valid = false;
         s->anchors[i].seq = 0;
     }
 }
@@ -89776,6 +90214,31 @@ bool ds4_session_capture_anchor(ds4_session *s, uint32_t tag) {
         }
     }
     if (!ok) return false;
+    s->anchors[idx].dspark_valid = false;
+    if (ok && ds41_dspark_ring_ready(g, pos)) {
+        if (!s->anchors[idx].dspark_target_bf16) {
+            s->anchors[idx].dspark_target_bf16 =
+                xmalloc((size_t)3u * DS41_DRAFT_WINDOW * DS4_N_EMBD * sizeof(uint16_t));
+        }
+        uint32_t *dtmp = xmalloc((size_t)raw_rows * DS4_N_EMBD * sizeof(uint32_t));
+        bool dok = true;
+        for (uint32_t stage = 0; dok && stage < 3u; stage++) {
+            const uint64_t elems = (uint64_t)raw_rows * DS4_N_EMBD;
+            if (!ds4_gpu_tensor_read(g->dspark->target[stage], 0, dtmp, elems * sizeof(uint32_t))) {
+                dok = false;
+                break;
+            }
+            uint16_t *dst = s->anchors[idx].dspark_target_bf16 +
+                            (size_t)stage * DS41_DRAFT_WINDOW * DS4_N_EMBD;
+            for (uint64_t e = 0; e < elems; e++) dst[e] = (uint16_t)(dtmp[e] >> 16u);
+        }
+        free(dtmp);
+        if (dok) {
+            memcpy(s->anchors[idx].dspark_positions, g->dspark->positions,
+                   sizeof(s->anchors[idx].dspark_positions));
+            s->anchors[idx].dspark_valid = true;
+        }
+    }
     memcpy(s->anchors[idx].logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     s->anchors[idx].history = g->history;
     s->anchors[idx].valid = true;
@@ -89902,6 +90365,28 @@ static bool ds4_session_restore_anchor_impl(ds4_session *s, int pos, bool allow_
         return false;
     }
     ds41_graph_reset(g);
+    if (s->anchors[idx].dspark_valid && s->anchors[idx].dspark_target_bf16 && g->dspark) {
+        uint32_t *dtmp = xmalloc((size_t)raw_rows * DS4_N_EMBD * sizeof(uint32_t));
+        bool dok = true;
+        for (uint32_t stage = 0; dok && stage < 3u; stage++) {
+            const uint64_t elems = (uint64_t)raw_rows * DS4_N_EMBD;
+            const uint16_t *src = s->anchors[idx].dspark_target_bf16 +
+                                  (size_t)stage * DS41_DRAFT_WINDOW * DS4_N_EMBD;
+            for (uint64_t e = 0; e < elems; e++) dtmp[e] = (uint32_t)src[e] << 16u;
+            if (!ds4_gpu_tensor_write(g->dspark->target[stage], 0, dtmp, elems * sizeof(uint32_t))) {
+                dok = false;
+                break;
+            }
+        }
+        free(dtmp);
+        if (dok) {
+            memcpy(g->dspark->positions, s->anchors[idx].dspark_positions,
+                   sizeof(g->dspark->positions));
+        }
+    }
+    if (s->pld_indexed_len > pos) s->pld_indexed_len = pos;
+    s->pld_consecutive_misses = 0;
+    s->pld_skip = 0;
     g->history = s->anchors[idx].history;
     g->pos = (uint32_t)pos;
     g->valid = true;
@@ -89955,7 +90440,9 @@ void ds4_session_free_test_checkpoint(ds4_session *s) {
     for (int i = 0; i < DS4_SESSION_MAX_ANCHORS; i++) {
         free(s->anchors[i].window_bf16);
         free(s->anchors[i].logits);
+        free(s->anchors[i].dspark_target_bf16);
     }
+    free(s->pld_buckets);
     token_vec_free(&s->checkpoint);
     free(s->checkpoint_images);
     free(s);

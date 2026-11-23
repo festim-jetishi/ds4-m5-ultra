@@ -388,7 +388,9 @@ kernel void kernel_dsv41_indexer_scores_packed(
         ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int HEADS = 32, KEYS = 64, DIM = 128;
     const uint width = args.x, token = group.y, row0 = group.x * KEYS;
-    const uint visible = (args.z + token + 1u) / args.w;
+    const uint ratio = args.w & 0xffu;
+    const bool keys_bf16 = (args.w >> 8u) != 0u;
+    const uint visible = (args.z + token + 1u) / ratio;
     if (row0 >= visible) {
         if (tid < KEYS && row0 + tid < width)
             scores[(ulong)token * width + row0 + tid] = -INFINITY;
@@ -397,11 +399,31 @@ kernel void kernel_dsv41_indexer_scores_packed(
     matmul2d<matmul2d_descriptor(HEADS, KEYS, DIM, false, true, false,
         matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<4>> mm;
     auto result = tensor(scratch, dextents<int32_t, 2>(KEYS, HEADS));
-    if (flags[range.y + token] && flags[range.x + group.x]) {
+    if (keys_bf16 && flags[range.y + token]) {
+        auto query = tensor((device bfloat *)packed_q + (ulong)(range.y + token) * HEADS * DIM,
+                             dextents<int32_t, 2>(DIM, HEADS));
+        auto all_keys = tensor((device bfloat *)keys, dextents<int32_t, 2>(DIM, int(width)));
+        auto key = all_keys.slice(0, int(row0));
+        auto dots = mm.template get_destination_cooperative_tensor<decltype(query), decltype(key), float>();
+        for (uint16_t i = 0; i < dots.get_capacity(); i++)
+            if (dots.is_valid_element(i)) dots[i] = 0;
+        mm.run(query, key, dots);
+        dots.store(result);
+    } else if (!keys_bf16 && flags[range.y + token] && flags[range.x + group.x]) {
         auto query = tensor((device bfloat *)packed_q + (ulong)(range.y + token) * HEADS * DIM,
                              dextents<int32_t, 2>(DIM, HEADS));
         auto key = tensor((device bfloat *)packed_keys + (ulong)row0 * DIM,
                            dextents<int32_t, 2>(DIM, KEYS));
+        auto dots = mm.template get_destination_cooperative_tensor<decltype(query), decltype(key), float>();
+        for (uint16_t i = 0; i < dots.get_capacity(); i++)
+            if (dots.is_valid_element(i)) dots[i] = 0;
+        mm.run(query, key, dots);
+        dots.store(result);
+    } else if (keys_bf16) {
+        auto query = tensor((device float *)q + (ulong)token * HEADS * DIM,
+                             dextents<int32_t, 2>(DIM, HEADS));
+        auto all_keys = tensor((device bfloat *)keys, dextents<int32_t, 2>(DIM, int(width)));
+        auto key = all_keys.slice(0, int(row0));
         auto dots = mm.template get_destination_cooperative_tensor<decltype(query), decltype(key), float>();
         for (uint16_t i = 0; i < dots.get_capacity(); i++)
             if (dots.is_valid_element(i)) dots[i] = 0;

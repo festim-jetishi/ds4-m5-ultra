@@ -4,7 +4,7 @@
 
 #define DS41_DRAFT_WINDOW 128u
 #define DS41_DRAFT_ROWS 5u
-#define DS41_VERIFY_ROWS (DS41_DRAFT_ROWS + 1u)
+#define DS41_VERIFY_ROWS 8u
 
 struct ds41_dspark {
     const ds4_dspark_weights *weights;

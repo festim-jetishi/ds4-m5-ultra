@@ -84,6 +84,36 @@ kernel void kernel_cpy_contig_f32_f16_4(
     }
 }
 
+static inline ushort ds4_f32_to_bf16_rne(float x) {
+    uint u = as_type<uint>(x);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return ushort((u >> 16u) | 0x0040u);
+    u += 0x7fffu + ((u >> 16u) & 1u);
+    return ushort(u >> 16u);
+}
+
+kernel void kernel_cpy_contig_f32_bf16_4(
+        constant uint & n,
+        device const float * src,
+        device       ushort * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint i = gid * 4u;
+    if (i >= n) return;
+    const uint remaining = n - i;
+    if (remaining >= 4u) {
+        const float4 v = float4(((device const packed_float4 *)src)[gid]);
+        ushort4 out = ushort4(
+            ds4_f32_to_bf16_rne(v.x),
+            ds4_f32_to_bf16_rne(v.y),
+            ds4_f32_to_bf16_rne(v.z),
+            ds4_f32_to_bf16_rne(v.w));
+        ((device packed_ushort4 *)dst)[gid] = packed_ushort4(out);
+        return;
+    }
+    for (uint lane = 0; lane < remaining; ++lane) {
+        dst[i + lane] = ds4_f32_to_bf16_rne(src[i + lane]);
+    }
+}
+
 kernel void kernel_cpy_contig_f16_f32_4(
         constant uint & n,
         device const half  * src,
