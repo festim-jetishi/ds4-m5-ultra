@@ -62052,6 +62052,11 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    bool exact_next_token_valid;
+    int exact_next_token;
+    int exact_next_pos;
+    float exact_next_temp, exact_next_top_p, exact_next_min_p;
+    int exact_next_top_k;
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
@@ -77349,6 +77354,7 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (s) s->exact_next_token_valid = false;
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
 #endif
@@ -78772,6 +78778,16 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (s->exact_next_token_valid &&
+        s->exact_next_pos == s->checkpoint.len &&
+        s->exact_next_temp == temperature &&
+        s->exact_next_top_k == top_k &&
+        s->exact_next_top_p == top_p &&
+        s->exact_next_min_p == min_p) {
+        s->exact_next_token_valid = false;
+        return s->exact_next_token;
+    }
+    s->exact_next_token_valid = false;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -79964,6 +79980,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    if (s) s->exact_next_token_valid = false;
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -87034,11 +87051,21 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         }
     }
     if (correction >= 0) {
-        if (ds4_session_eval(s, correction, err, errlen)) return -1;
-        accepted[keep++] = correction;
-        /* The correction occupies a rejected slot whose old ring contents
-         * are already saved. Earlier verified prefixes remain rewindable. */
-        d->rewind_end = g->pos;
+        if (!getenv("DS4_DSPARK_DISABLE_DEFER_CORRECTION")) {
+            /* Defer residual-sampled correction token to next DSpark cycle so
+             * it becomes tokens[0] instead of burning a 1-token eval pass. */
+            s->exact_next_token = correction;
+            s->exact_next_pos = s->checkpoint.len;
+            s->exact_next_temp = temperature;
+            s->exact_next_top_k = top_k;
+            s->exact_next_top_p = top_p;
+            s->exact_next_min_p = min_p;
+            s->exact_next_token_valid = true;
+        } else {
+            if (ds4_session_eval(s, correction, err, errlen)) return -1;
+            accepted[keep++] = correction;
+            d->rewind_end = g->pos;
+        }
     }
     if (getenv("DS4_DSPARK_SPEC_LOG")) fprintf(stderr,
         "ds4: V4.1 DSpark proposed=%u accepted=%u draft=%.3f ms verify=%.3f ms\n",
@@ -88264,6 +88291,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 
 void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
+    s->exact_next_token_valid = false;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
@@ -88389,6 +88417,7 @@ static bool dspark_rewind_recent(ds4_session *s, int pos) {
 #endif
 
 bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
+    if (s) s->exact_next_token_valid = false;
 #ifdef DS4_NO_GPU
     (void)s; (void)pos;
     return false;
@@ -88424,6 +88453,7 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
+    s->exact_next_token_valid = false;
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
     if (ds4_session_rewind_speculative(s, pos)) return;
