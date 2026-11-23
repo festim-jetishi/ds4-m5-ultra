@@ -73445,6 +73445,14 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
         return false;
     }
+#ifdef __APPLE__
+    /* Respect an explicit macOS iogpu.wired_limit_mb override above 7/8 RAM
+     * while always keeping at least 16 GiB reserved for macOS + file cache. */
+    if (host >= 128u * gib && recommended > budget) {
+        const uint64_t cap = host - 16u * gib;
+        budget = recommended < cap ? recommended : cap;
+    }
+#endif
     if (budget > recommended) budget = recommended;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
