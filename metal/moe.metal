@@ -3516,6 +3516,61 @@ DS41_ATTN_OUT_LOW_ROWS(6)
 DS41_ATTN_OUT_LOW_ROWS(7)
 DS41_ATTN_OUT_LOW_ROWS(8)
 
+template<short R>
+void kernel_dsv41_attn_out_low_q8_0_rows_1sg_impl(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const int group = tgpig.z;
+    tgpig.z = 0;
+
+    ds4_metal_args_mul_mv args0 = {
+        /*.ne00 =*/ args.ne00,
+        /*.ne01 =*/ args.ne01,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ args.nb00,
+        /*.nb01 =*/ args.nb01,
+        /*.nb02 =*/ args.nb02,
+        /*.nb03 =*/ args.nb02,
+        /*.ne10 =*/ args.ne10,
+        /*.ne11 =*/ R,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ args.nb10,
+        /*.nb11 =*/ args.nb12,
+        /*.nb12 =*/ args.nb12,
+        /*.nb13 =*/ args.nb12,
+        /*.ne0  =*/ args.ne0 * args.ne1,
+        /*.ne1  =*/ R,
+        /*.nr0  =*/ args.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    kernel_mul_mv_q8_0_f32_rows_1sg_r2_impl<R, true, thread ds4_metal_args_mul_mv &>(
+        args0,
+        src0s + (uint64_t)group * args.nb02,
+        src1 + (uint64_t)group * args.nb11,
+        dst + (uint64_t)group * args.ne0 * sizeof(float),
+        tgpig,
+        tiisg,
+        sgitg);
+}
+
+#define DS41_ATTN_OUT_LOW_ROWS_1SG(R) kernel void kernel_dsv41_attn_out_low_q8_0_rows##R##_bf16_1sg(         constant ds4_metal_args_mul_mv_id & args,         device const char * src0s,         device const char * src1,         device       char * dst,         uint3  tgpig [[threadgroup_position_in_grid]],         ushort tiisg [[thread_index_in_simdgroup]],         ushort sgitg [[simdgroup_index_in_threadgroup]]) {     kernel_dsv41_attn_out_low_q8_0_rows_1sg_impl<R>(args, src0s, src1, dst, tgpig, tiisg, sgitg); }
+DS41_ATTN_OUT_LOW_ROWS_1SG(2)
+DS41_ATTN_OUT_LOW_ROWS_1SG(3)
+DS41_ATTN_OUT_LOW_ROWS_1SG(4)
+DS41_ATTN_OUT_LOW_ROWS_1SG(5)
+DS41_ATTN_OUT_LOW_ROWS_1SG(6)
+DS41_ATTN_OUT_LOW_ROWS_1SG(7)
+DS41_ATTN_OUT_LOW_ROWS_1SG(8)
+#undef DS41_ATTN_OUT_LOW_ROWS_1SG
+
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,

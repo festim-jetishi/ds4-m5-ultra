@@ -41504,7 +41504,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch. */
     if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
 #ifdef __APPLE__
-        outputs != DS4_N_VOCAB &&
+        (outputs != DS4_N_VOCAB || getenv("DS4_METAL_DISABLE_LM_HEAD_ROWS") == NULL) &&
 #endif
         weight->type == DS4_TENSOR_Q8_0) {
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,

@@ -532,6 +532,94 @@ DS4_Q8_ROWS_BF16_KERNEL(6)
 DS4_Q8_ROWS_BF16_KERNEL(7)
 DS4_Q8_ROWS_BF16_KERNEL(8)
 
+
+// 1 simdgroup = 2 output rows (ZERO threadgroup memory, ZERO barriers).
+// Pre-scales int8 weights by block scale d once per block before dotting across
+// all NR1 activation rows using packed 64-bit loads + float4 dot().
+template<short NR1, bool ROUND = false,
+         typename args_t = constant ds4_metal_args_mul_mv &>
+void kernel_mul_mv_q8_0_f32_rows_1sg_r2_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const int r0 = (int)((tgpig.x * NSG + sgitg) * 2);
+    if (r0 >= args.ne01) return;
+
+    const int nb = args.ne00 / QK8_0;
+    device const block_q8_0 * ax0 = (device const block_q8_0 *)(src0 + (uint64_t)r0 * args.nb01);
+    device const block_q8_0 * ax1 = (device const block_q8_0 *)(src0 + (uint64_t)(r0 + 1 < args.ne01 ? r0 + 1 : args.ne01 - 1) * args.nb01);
+
+    const short ix = tiisg / 4;
+    const short il = tiisg % 4;
+    const uint ystride = (uint)(args.nb11 / 16u);
+    device const float4 * yb4 = (device const float4 *)src1 + (ix * QK8_0 + il * 8) / 4;
+
+    float s0[NR1];
+    float s1[NR1];
+    FOR_UNROLL (short t = 0; t < NR1; ++t) {
+        s0[t] = 0.f;
+        s1[t] = 0.f;
+    }
+
+    for (int ib = ix; ib < nb; ib += 8) {
+        const float d0 = (float)ax0[ib].d;
+        const ushort4 qv0 = *(device const packed_ushort4 *)(ax0[ib].qs + il * 8);
+        const float4 qa0 = float4(as_type<char4>(ushort2(qv0[0], qv0[1]))) * d0;
+        const float4 qb0 = float4(as_type<char4>(ushort2(qv0[2], qv0[3]))) * d0;
+
+        const float d1 = (float)ax1[ib].d;
+        const ushort4 qv1 = *(device const packed_ushort4 *)(ax1[ib].qs + il * 8);
+        const float4 qa1 = float4(as_type<char4>(ushort2(qv1[0], qv1[1]))) * d1;
+        const float4 qb1 = float4(as_type<char4>(ushort2(qv1[2], qv1[3]))) * d1;
+
+        FOR_UNROLL (short t = 0; t < NR1; ++t) {
+            device const float4 * yt = yb4 + (uint)t * ystride;
+            const float4 y0 = yt[0];
+            const float4 y1 = yt[1];
+            s0[t] += dot(qa0, y0) + dot(qb0, y1);
+            s1[t] += dot(qa1, y0) + dot(qb1, y1);
+        }
+        yb4 += 8 * 8;
+    }
+
+    FOR_UNROLL (short t = 0; t < NR1; ++t) {
+        const float t0 = simd_sum(s0[t]);
+        const float t1 = simd_sum(s1[t]);
+        if (tiisg == 0) {
+            device float * dst_t = (device float *)dst + (uint64_t)t * args.ne0;
+            dst_t[r0] = ROUND ? ds4_round_bf16(t0) : t0;
+            if (r0 + 1 < args.ne01) {
+                dst_t[r0 + 1] = ROUND ? ds4_round_bf16(t1) : t1;
+            }
+        }
+    }
+}
+
+#define DS4_Q8_ROWS_1SG_KERNEL(R) [[host_name("kernel_mul_mv_q8_0_f32_rows" #R "_1sg")]] kernel void kernel_mul_mv_q8_0_f32_rows##R##_1sg(         constant ds4_metal_args_mul_mv & args,         device const char * src0,         device const char * src1,         device       char * dst,         uint3  tgpig [[threadgroup_position_in_grid]],         ushort tiisg [[thread_index_in_simdgroup]],         ushort sgitg [[simdgroup_index_in_threadgroup]]) {     kernel_mul_mv_q8_0_f32_rows_1sg_r2_impl<R, false>(args, src0, src1, dst, tgpig, tiisg, sgitg); }
+DS4_Q8_ROWS_1SG_KERNEL(2)
+DS4_Q8_ROWS_1SG_KERNEL(3)
+DS4_Q8_ROWS_1SG_KERNEL(4)
+DS4_Q8_ROWS_1SG_KERNEL(5)
+DS4_Q8_ROWS_1SG_KERNEL(6)
+DS4_Q8_ROWS_1SG_KERNEL(7)
+DS4_Q8_ROWS_1SG_KERNEL(8)
+
+#define DS4_Q8_ROWS_BF16_1SG_KERNEL(R) [[host_name("kernel_mul_mv_q8_0_f32_rows" #R "_bf16_1sg")]] kernel void kernel_mul_mv_q8_0_f32_rows##R##_bf16_1sg(         constant ds4_metal_args_mul_mv & args,         device const char * src0,         device const char * src1,         device       char * dst,         uint3  tgpig [[threadgroup_position_in_grid]],         ushort tiisg [[thread_index_in_simdgroup]],         ushort sgitg [[simdgroup_index_in_threadgroup]]) {     kernel_mul_mv_q8_0_f32_rows_1sg_r2_impl<R, true>(args, src0, src1, dst, tgpig, tiisg, sgitg); }
+DS4_Q8_ROWS_BF16_1SG_KERNEL(2)
+DS4_Q8_ROWS_BF16_1SG_KERNEL(3)
+DS4_Q8_ROWS_BF16_1SG_KERNEL(4)
+DS4_Q8_ROWS_BF16_1SG_KERNEL(5)
+DS4_Q8_ROWS_BF16_1SG_KERNEL(6)
+DS4_Q8_ROWS_BF16_1SG_KERNEL(7)
+DS4_Q8_ROWS_BF16_1SG_KERNEL(8)
+#undef DS4_Q8_ROWS_1SG_KERNEL
+#undef DS4_Q8_ROWS_BF16_1SG_KERNEL
+
 // The original layout for 3-8 rows (DS4_METAL_DISABLE_Q8_WIDE_ROWS).
 #define DS4_Q8_ROWS_NARROW_KERNEL(R, RS, ROUND) [[host_name("kernel_mul_mv_q8_0_f32_rows" #R RS "_narrow")]] kernel void kernel_mul_mv_q8_0_f32_rows##R##_narrow##ROUND(         constant ds4_metal_args_mul_mv & args,         device const char * src0,         device const char * src1,         device       char * dst,         threadgroup  char * shmem [[threadgroup(0)]],         uint3  tgpig[[threadgroup_position_in_grid]],         ushort tiisg[[thread_index_in_simdgroup]],         ushort sgitg[[simdgroup_index_in_threadgroup]]) {     kernel_mul_mv_q8_0_f32_rows_impl<DS4_Q8_ROWS_NR0, R, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
 DS4_Q8_ROWS_NARROW_KERNEL(3, "", false)
