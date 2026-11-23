@@ -13873,13 +13873,23 @@ static void *decode_worker_main(void *arg) {
             int max_tokens[DS4_SERVER_DSPARK_BATCH_LIMIT], eos[DS4_SERVER_DSPARK_BATCH_LIMIT];
             bool ignore_eos[DS4_SERVER_DSPARK_BATCH_LIMIT];
             ds4_think_mode think[DS4_SERVER_DSPARK_BATCH_LIMIT];
+            float temperature[DS4_SERVER_DSPARK_BATCH_LIMIT];
+            int top_k[DS4_SERVER_DSPARK_BATCH_LIMIT];
+            float top_p[DS4_SERVER_DSPARK_BATCH_LIMIT], min_p[DS4_SERVER_DSPARK_BATCH_LIMIT];
+            uint64_t *rngs[DS4_SERVER_DSPARK_BATCH_LIMIT];
             for (int i = 0; i < count; i++) {
                 max_tokens[i] = members[i]->decode_max_tokens;
                 eos[i] = members[i]->decode_eos;
                 ignore_eos[i] = members[i]->decode_ignore_eos;
                 think[i] = members[i]->decode_think_mode;
+                temperature[i] = members[i]->decode_ignore_eos ? 0.0f : members[i]->decode_temperature;
+                top_k[i] = members[i]->decode_top_k;
+                top_p[i] = members[i]->decode_top_p;
+                min_p[i] = members[i]->decode_min_p;
+                rngs[i] = members[i]->decode_ignore_eos ? NULL : members[i]->decode_rng;
             }
-            rc = ds4_sessions_eval_batch_dspark(items, count, max_tokens, eos, ignore_eos, think,
+            rc = ds4_sessions_eval_batch_dspark_sampled(items, count, max_tokens, eos, ignore_eos,
+                    think, temperature, top_k, top_p, min_p, rngs,
                     accepted, n_accepted, batch_err, sizeof(batch_err));
         } else if (rc == 0 && solo) {
             const server_slot *m = members[0];

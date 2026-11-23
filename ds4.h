@@ -593,6 +593,13 @@ int ds4_sessions_eval_batch_dspark(ds4_decode_item *items, int count,
         const int *max_tokens, const int *eos_tokens, const bool *ignore_eos,
         const ds4_think_mode *think_modes, int (*accepted)[17], int *n_accepted,
         char *err, size_t errlen);
+int ds4_sessions_eval_batch_dspark_sampled(ds4_decode_item *items, int count,
+        const int *max_tokens, const int *eos_tokens, const bool *ignore_eos,
+        const ds4_think_mode *think_modes,
+        const float *temperature, const int *top_k, const float *top_p,
+        const float *min_p, uint64_t *const *rngs,
+        int (*accepted)[17], int *n_accepted,
+        char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */
