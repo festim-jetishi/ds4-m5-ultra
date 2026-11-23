@@ -22,6 +22,7 @@ struct ds41_dspark {
     /* Rollback rows saved during drafting (for a verify at saved_start). */
     uint32_t saved_start;
     bool saved;
+    bool row0_markov_done;
     ds4_gpu_tensor *chain_tokens, *chain_conf;
     ds41_gpu_graph verified[DS41_VERIFY_ROWS + 1u];
     float *host_verified;
@@ -384,12 +385,29 @@ static DS4_MAYBE_UNUSED int ds41_dspark_markov_chain(ds41_dspark *d, const ds4_m
 
 /* Leaves the five base-logit rows and unnormalized collapsed features on the
  * GPU. Markov sampling is sequential and performed after this stage chain. */
-static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model *target,
+static DS4_MAYBE_UNUSED bool ds41_dspark_forward_ex(ds41_dspark *d, const ds4_model *target,
                                  const ds4_weights *tw, const ds4_model *draft,
-                                 uint32_t pos, int token, ds41_gpu_graph *target_graph) {
+                                 uint32_t pos, int token, ds41_gpu_graph *target_graph,
+                                 bool fuse_row0_markov) {
     if (!d || !pos || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     ds41_prefill_row *b = &d->batch;
+    d->row0_markov_done = false;
     const bool local_experts = target_graph && target_graph->tp_world == 2;
+#ifdef __APPLE__
+    ds4_gpu_tensor *row0_w2_bf16 = NULL;
+    if (fuse_row0_markov && !local_experts && d->weights->markov_rank == 256u) {
+        const ds4_dspark_stage_weights *last = &d->weights->stage[2];
+        float emb0[256];
+        row0_w2_bf16 = ds41_markov_w2_bf16(draft, last->markov_w2);
+        if (row0_w2_bf16 && dspark_dense_row_to_f32(emb0, draft, last->markov_w1, (uint32_t)token)) {
+            if (!ds4_gpu_tensor_write(d->markov_embed, 0, emb0, sizeof(emb0))) row0_w2_bf16 = NULL;
+        } else {
+            row0_w2_bf16 = NULL;
+        }
+    }
+#else
+    (void)fuse_row0_markov;
+#endif
     if (local_experts) ds4_gpu_tp_suspend_expert_sharding(1);
     bool ok = ds4_gpu_begin_commands() && ds41_dspark_seed(d, draft, pos);
     if (!ok) fprintf(stderr, "ds4: V4.1 DSpark seed failed\n");
@@ -419,10 +437,25 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
     d->saved = false;
     if (ok && pipelined && target_graph && ds4_gpu_flush_commands())
         ok = ds41_dspark_save_rows(d, target_graph);
+#ifdef __APPLE__
+    if (ok && row0_w2_bf16) {
+        const uint64_t lbytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+        ds4_gpu_tensor *logits0 = ds4_gpu_tensor_view(d->logits, 0, lbytes);
+        ok = logits0 && ds4_gpu_matmul_bf16_k256_add_tensor(logits0, row0_w2_bf16, DS4_N_VOCAB, d->markov_embed) != 0;
+        ds4_gpu_tensor_free(logits0);
+        if (ok) d->row0_markov_done = true;
+    }
+#endif
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (local_experts) ds4_gpu_tp_suspend_expert_sharding(0);
-    if (!ok) d->kv_valid = false;
+    if (!ok) { d->kv_valid = false; d->row0_markov_done = false; }
     return ok;
+}
+
+static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model *target,
+                                 const ds4_weights *tw, const ds4_model *draft,
+                                 uint32_t pos, int token, ds41_gpu_graph *target_graph) {
+    return ds41_dspark_forward_ex(d, target, tw, draft, pos, token, target_graph, false);
 }
 
 static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model *m,
@@ -458,6 +491,51 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
     ds4_gpu_tensor_free(logits);
     return ok;
 }
+
+#ifdef __APPLE__
+/* Compute DSpark Markov confidence on CPU directly from unified-memory d->batch.x
+ * and markov_w1[previous], avoiding 2 GPU blit copies + GPU matvec and allowing
+ * early exit BEFORE running the 66 MB markov_w2 kernel + CB sync on the stopping row. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_markov_confidence_cpu(
+        ds41_dspark *d, const ds4_model *m, uint32_t row, int previous,
+        float embedding[256], float *confidence) {
+    if (!d || row >= DS41_DRAFT_ROWS || previous < 0 ||
+        (uint32_t)previous >= DS4_N_VOCAB || !confidence ||
+        d->weights->markov_rank != 256u) return false;
+    const ds4_dspark_stage_weights *last = &d->weights->stage[2];
+    if (!dspark_dense_row_to_f32(embedding, m, last->markov_w1, (uint32_t)previous))
+        return false;
+    const float *bx = (const float *)ds4_gpu_tensor_contents(d->batch.x);
+    if (!bx) return false;
+    float features[DS4_N_EMBD + 256u];
+    memcpy(features, bx + (uint64_t)row * DS4_N_EMBD, (uint64_t)DS4_N_EMBD * sizeof(float));
+    memcpy(features + DS4_N_EMBD, embedding, 256u * sizeof(float));
+    matvec_any(confidence, m, last->confidence_proj, features);
+    return true;
+}
+
+/* Apply only markov_w2 (+ add onto d->logits[row]) on GPU without confidence or host copy.
+ * Caller reads d->logits[row] zero-copy via ds4_gpu_tensor_contents(d->logits). */
+static DS4_MAYBE_UNUSED bool ds41_dspark_markov_add_logits_only(
+        ds41_dspark *d, const ds4_model *m, uint32_t row, const float embedding[256]) {
+    if (!d || row >= DS41_DRAFT_ROWS) return false;
+    if (row == 0u && d->row0_markov_done) return true;
+    const ds4_dspark_stage_weights *last = &d->weights->stage[2];
+    const uint64_t bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    ds4_gpu_tensor *logits = ds4_gpu_tensor_view(d->logits, row * bytes, bytes);
+    ds4_gpu_tensor *w2_bf16 = ds41_markov_w2_bf16(m, last->markov_w2);
+    bool ok = logits &&
+        ds4_gpu_tensor_write(d->markov_embed, 0, embedding, 256u * sizeof(float)) &&
+        ds4_gpu_begin_commands() &&
+        (w2_bf16 ?
+            (ds4_gpu_matmul_bf16_k256_add_tensor(logits, w2_bf16, DS4_N_VOCAB, d->markov_embed) != 0) :
+            (ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
+             ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB)));
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    ds4_gpu_tensor_free(logits);
+    return ok;
+}
+#endif
 
 /* Snapshots and verify row graphs for count rows (1 to DS41_VERIFY_ROWS) at
  * g->pos, encoded into the active command batch; graphs[i] receives row i. */

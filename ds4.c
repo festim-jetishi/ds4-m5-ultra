@@ -84453,7 +84453,7 @@ static int ds4_session_eval_dspark_speculative_stochastic(
 /* The target vocabulary is sharded on CUDA. Both ranks keep the small native
  * drafter resident, then exchange its head rows before the leader applies the
  * sequential Markov bias. Metal currently keeps the complete target head. */
-static bool ds41_session_draft(ds4_session *s, int token) {
+static bool ds41_session_draft_ex(ds4_session *s, int token, bool fuse_row0_markov) {
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
     ds41_dspark *d = g->dspark;
@@ -84461,7 +84461,8 @@ static bool ds41_session_draft(ds4_session *s, int token) {
     if (!d || (split && e->tp.rank == 0 &&
         !ds4_tp_send_dspark_draft(e->tp.ctx, s->tp_session_id, token,
                                   (int)g->pos, DS4_TP_DSPARK_DRAFT))) return false;
-    if (!ds41_dspark_forward(d, &e->model, &e->weights, &e->mtp_model, g->pos, token, g))
+    if (!ds41_dspark_forward_ex(d, &e->model, &e->weights, &e->mtp_model, g->pos, token, g,
+                                fuse_row0_markov && !split))
         return false;
     if (!split) return true;
     const uint32_t half = DS4_N_VOCAB / 2u;
@@ -84481,6 +84482,10 @@ static bool ds41_session_draft(ds4_session *s, int token) {
     }
     return e->tp.rank == 1 || ds4_gpu_tensor_write(d->logits, 0, d->host_logits,
         (uint64_t)DS41_DRAFT_ROWS * DS4_N_VOCAB * sizeof(float));
+}
+
+static bool ds41_session_draft(ds4_session *s, int token) {
+    return ds41_session_draft_ex(s, token, false);
 }
 
 static bool ds41_session_verify(ds4_session *s, const int *tokens, uint32_t count) {
@@ -87668,7 +87673,12 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     }
     const bool exact = temperature > 0 && e->dspark_exact_sampling;
     const double started = now_sec();
-    if (!ds41_session_draft(s, first_token))
+#ifdef __APPLE__
+    const bool fast_markov = exact && !getenv("DS4_METAL_DISABLE_DSPARK_FAST_MARKOV");
+#else
+    const bool fast_markov = false;
+#endif
+    if (!ds41_session_draft_ex(s, first_token, fast_markov))
         goto fail;
     int tokens[DS41_VERIFY_ROWS] = {first_token};
     uint32_t count = 1;
@@ -87695,10 +87705,27 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     for (; chain < 0 && count < (uint32_t)cap; count++) {
         const uint32_t row = count - 1u;
         float confidence;
-        if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
-        if (e->dspark_confidence_threshold > 0 &&
-            sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
-        const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
+        const float *qlogits = NULL;
+#ifdef __APPLE__
+        if (fast_markov) {
+            float emb[256];
+            if (!ds41_dspark_markov_confidence_cpu(d, &e->mtp_model, row, tokens[row], emb, &confidence))
+                goto fail;
+            if (e->dspark_confidence_threshold > 0 &&
+                sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
+            if (!ds41_dspark_markov_add_logits_only(d, &e->mtp_model, row, emb))
+                goto fail;
+            const float *shared_logits = (const float *)ds4_gpu_tensor_contents(d->logits);
+            if (!shared_logits) goto fail;
+            qlogits = shared_logits + (uint64_t)row * DS4_N_VOCAB;
+        } else
+#endif
+        {
+            if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
+            if (e->dspark_confidence_threshold > 0 &&
+                sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
+            qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
+        }
         if (exact) {
             float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
             if (!rng || !sample_build_probabilities_ex(qlogits, DS4_N_VOCAB,
