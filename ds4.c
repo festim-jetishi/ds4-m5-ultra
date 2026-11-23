@@ -43398,6 +43398,13 @@ static bool ds41_cuda_row_batch_supported(const ds41_gpu_graph *g, const ds4_wei
 
 static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weights *w,
                                         uint32_t remaining) {
+#ifdef __APPLE__
+    if (remaining >= 2u && remaining < 64u && !g->streaming && g->tp_world == 1 &&
+        !g->quality && !g->imatrix && !g->image_count &&
+        !getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL") &&
+        !getenv("DS4_METAL_DISABLE_V41_SHORT_PREFILL"))
+        return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
+#endif
     if (remaining < 2u || remaining >= 256u ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL") || !ds41_cuda_row_batch_supported(g, w))
         return 0;
