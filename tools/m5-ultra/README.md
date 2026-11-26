@@ -26,3 +26,21 @@ How it works:
 1. Reads local Q2 + all 9 remote MXFP4 shard headers via HTTP Range (`gguf_inspect.py`, ~10 MiB total).
 2. Streams **only layers 30–39** (`67.2 GiB` instead of `500+ GiB`, resumable) and verifies every tensor's cosine similarity against Q2 (`mixfetch.py` + `mixcheck.c`).
 3. Writes `gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4.gguf` (`372.2 GiB`) preserving ds4's resident-first, Engram-last disk layout (`mixwrite.py`).
+
+## 3. Optional Directional Ablation / Refusal Removal (`apply_abliteration.sh`)
+
+Applies the MIT-licensed rank-2 directional refusal ablation (`W' = W - s·Q·Qᵀ·W`) from [`mrfakename/DeepSeek-V4.1-Flash-1017-abliterated`](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated) directly to the Q8_0 `attn_output_b` and `ffn_down_shexp` tensors of either the mixed `Q2-L30-39-MXFP4` GGUF or pure Q2 GGUF — using the included `43 KB` `abliteration-edit.npz` and fixed-seed stochastic Q8_0 rounding (pure NumPy, ~15 seconds, zero large downloads, APFS copy-on-write `cp -c` on macOS):
+
+```bash
+# Patches gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4.gguf -> ...-abliterated.gguf
+./tools/m5-ultra/apply_abliteration.sh
+
+# Or pass any compatible DeepSeek-V4.1-Flash GGUF (e.g. pure Q2):
+./tools/m5-ultra/apply_abliteration.sh \
+  gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf \
+  gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix-abliterated.gguf
+```
+
+- Routed experts, embeddings, Engram tables, and DSpark layers remain bit-identical (`0%` speed change).
+- Optional FP8 reference cross-checker: `ablfetch.py` downloads only the edited FP8 tensors via HTTP Range requests for `--verify-dir` comparison.
+- *Disclaimer (from upstream `mrfakename/DeepSeek-V4.1-Flash-1017-abliterated`):* an abliterated model will comply with harmful requests; you are responsible for how you use it.
