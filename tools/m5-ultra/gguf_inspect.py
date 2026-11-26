@@ -1,1 +1,91 @@
-import json, struct, sys, urllib.request# gguf_inspect.py SRC OUT.json: header, metadata and tensor directory of a GGUF.# SRC is a local path or an http(s) URL; URLs are read with 1 MiB Range# requests (only the header bytes are fetched, never the tensor data).class RangeFile:    def __init__(self, url, chunk=1 << 20):        self.url, self.chunk, self.pos, self.cache, self.fetched = url, chunk, 0, {}, 0    def _block(self, i):        if i not in self.cache:            rng = "bytes=%d-%d" % (i * self.chunk, (i + 1) * self.chunk - 1)            resp = urllib.request.urlopen(urllib.request.Request(self.url, headers={"Range": rng}))            if resp.status != 206:                resp.close()                raise RuntimeError("server ignored the Range request (status %d)" % resp.status)            data = resp.read(self.chunk)            resp.close()            self.cache[i] = data            self.fetched += len(data)        return self.cache[i]    def read(self, n):        out = b""        while n > 0:            i, o = divmod(self.pos, self.chunk)            b = self._block(i)[o:o + n]            if not b:                break            out += b            self.pos += len(b)            n -= len(b)        return out    def tell(self):        return self.possrc = sys.argv[1]f = RangeFile(src) if src.startswith("http") else open(src, "rb")def rd(fmt):    size = struct.calcsize("<" + fmt)    return struct.unpack("<" + fmt, f.read(size))def rstr():    (n,) = rd("Q")    return f.read(n).decode("utf-8", "replace")SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}def rval(t):    if t in SCALAR:        return rd(SCALAR[t])[0]    if t == 8:        return rstr()    if t == 9:        et, n = rd("IQ")        vals = [rval(et) for _ in range(n)]        return {"array": et, "n": n, "head": vals[:8]} if n > 64 or et == 8 and n > 8 else vals    raise ValueError(t)magic = f.read(4)assert magic == b"GGUF", magicver, nt, nkv = rd("IQQ")kv = {}for _ in range(nkv):    k = rstr()    (t,) = rd("I")    kv[k] = rval(t)tensors = []for _ in range(nt):    name = rstr()    (nd,) = rd("I")    dims = list(rd("Q" * nd))    ty, off = rd("IQ")    tensors.append([name, dims, ty, off])align = kv.get("general.alignment", 32)data_start = (f.tell() + align - 1) // align * alignjson.dump({"version": ver, "alignment": align, "data_start": data_start, "kv": kv,           "tensors": tensors}, open(sys.argv[2], "w"), default=str)print("%s: version %d, %d tensors, %d kv, data_start %d%s" % (    src.rsplit("/", 1)[-1], ver, nt, nkv, data_start,    ", fetched %.1f MiB" % (f.fetched / 1048576) if isinstance(f, RangeFile) else ""))
+import json, struct, sys, urllib.request
+
+# gguf_inspect.py SRC OUT.json: header, metadata and tensor directory of a GGUF.
+# SRC is a local path or an http(s) URL; URLs are read with 1 MiB Range
+# requests (only the header bytes are fetched, never the tensor data).
+
+
+class RangeFile:
+    def __init__(self, url, chunk=1 << 20):
+        self.url, self.chunk, self.pos, self.cache, self.fetched = url, chunk, 0, {}, 0
+
+    def _block(self, i):
+        if i not in self.cache:
+            rng = "bytes=%d-%d" % (i * self.chunk, (i + 1) * self.chunk - 1)
+            resp = urllib.request.urlopen(urllib.request.Request(self.url, headers={"Range": rng}))
+            if resp.status != 206:
+                resp.close()
+                raise RuntimeError("server ignored the Range request (status %d)" % resp.status)
+            data = resp.read(self.chunk)
+            resp.close()
+            self.cache[i] = data
+            self.fetched += len(data)
+        return self.cache[i]
+
+    def read(self, n):
+        out = b""
+        while n > 0:
+            i, o = divmod(self.pos, self.chunk)
+            b = self._block(i)[o:o + n]
+            if not b:
+                break
+            out += b
+            self.pos += len(b)
+            n -= len(b)
+        return out
+
+    def tell(self):
+        return self.pos
+
+
+src = sys.argv[1]
+f = RangeFile(src) if src.startswith("http") else open(src, "rb")
+
+
+def rd(fmt):
+    size = struct.calcsize("<" + fmt)
+    return struct.unpack("<" + fmt, f.read(size))
+
+
+def rstr():
+    (n,) = rd("Q")
+    return f.read(n).decode("utf-8", "replace")
+
+
+SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+
+
+def rval(t):
+    if t in SCALAR:
+        return rd(SCALAR[t])[0]
+    if t == 8:
+        return rstr()
+    if t == 9:
+        et, n = rd("IQ")
+        vals = [rval(et) for _ in range(n)]
+        return {"array": et, "n": n, "head": vals[:8]} if n > 64 or et == 8 and n > 8 else vals
+    raise ValueError(t)
+
+
+magic = f.read(4)
+assert magic == b"GGUF", magic
+ver, nt, nkv = rd("IQQ")
+kv = {}
+for _ in range(nkv):
+    k = rstr()
+    (t,) = rd("I")
+    kv[k] = rval(t)
+tensors = []
+for _ in range(nt):
+    name = rstr()
+    (nd,) = rd("I")
+    dims = list(rd("Q" * nd))
+    ty, off = rd("IQ")
+    tensors.append([name, dims, ty, off])
+align = kv.get("general.alignment", 32)
+data_start = (f.tell() + align - 1) // align * align
+json.dump({"version": ver, "alignment": align, "data_start": data_start, "kv": kv,
+           "tensors": tensors}, open(sys.argv[2], "w"), default=str)
+print("%s: version %d, %d tensors, %d kv, data_start %d%s" % (
+    src.rsplit("/", 1)[-1], ver, nt, nkv, data_start,
+    ", fetched %.1f MiB" % (f.fetched / 1048576) if isinstance(f, RangeFile) else ""))

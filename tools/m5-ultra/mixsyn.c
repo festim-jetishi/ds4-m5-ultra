@@ -1,1 +1,134 @@
-// mixsyn SRC TYPE NCOLS NROWS SRC_OFF DST DST_OFF THREADS// Dequantizes one IQ2_XXS (16) or Q2_K (10) tensor of SRC and writes it as// MXFP4 (ds4 layout) into DST at DST_OFF. Synthetic data for speed and// loader tests only: the values are the Q2 weights, not DeepSeek's MXFP4.#include <fcntl.h>#include <math.h>#include <pthread.h>#include <stdint.h>#include <stdio.h>#include <stdlib.h>#include <string.h>#include <sys/mman.h>#include <unistd.h>#include "iq2tab.h"typedef struct { uint8_t scales[16], qs[64]; uint16_t d, dmin; } block_q2_K;typedef struct { uint16_t d; uint16_t qs[32]; } block_iq2_xxs;typedef struct { uint8_t e; uint8_t qs[16]; } block_mxfp4;static const float mx_values[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};static float h2f(uint16_t h) { __fp16 v; memcpy(&v, &h, 2); return (float)v; }static void deq_q2_K(const block_q2_K *x, float *y, int nb) {    for (int i = 0; i < nb; i++) {        const float d = h2f(x[i].d), min = h2f(x[i].dmin);        const uint8_t *q = x[i].qs;        int is = 0;        for (int n = 0; n < 256; n += 128) {            int shift = 0;            for (int j = 0; j < 4; j++) {                uint8_t sc = x[i].scales[is++];                float dl = d * (sc & 0xF), ml = min * (sc >> 4);                for (int l = 0; l < 16; l++) *y++ = dl * ((q[l] >> shift) & 3) - ml;                sc = x[i].scales[is++];                dl = d * (sc & 0xF); ml = min * (sc >> 4);                for (int l = 0; l < 16; l++) *y++ = dl * ((q[l + 16] >> shift) & 3) - ml;                shift += 2;            }            q += 32;        }    }}static void deq_iq2_xxs(const block_iq2_xxs *x, float *y, int nb) {    uint32_t aux32[2];    const uint8_t *aux8 = (const uint8_t *)aux32;    for (int i = 0; i < nb; i++) {        const float d = h2f(x[i].d);        for (int ib32 = 0; ib32 < 8; ib32++) {            memcpy(aux32, x[i].qs + 4 * ib32, 8);            const float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;            for (int l = 0; l < 4; l++) {                const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> 7 * l) & 127];                for (int j = 0; j < 8; j++) y[j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);                y += 8;            }        }    }}static uint8_t mx_code(float v) {    const float a = fabsf(v);    int best = 0;    for (int k = 1; k < 8; k++) if (fabsf(mx_values[k] - a) < fabsf(mx_values[best] - a)) best = k;    return (uint8_t)(best | (v < 0.0f && best ? 8 : 0));}static void quant_mxfp4(const float *x, block_mxfp4 *out, int nb) {    for (int i = 0; i < nb; i++, x += 32) {        float amax = 0.0f;        for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(x[j]));        int e = amax > 0.0f ? (int)ceilf(log2f(amax / 6.0f)) + 127 : 0;        if (e < 1) e = 1;        if (e > 254) e = 254;        const float inv = 1.0f / ldexpf(1.0f, e - 127);        out[i].e = (uint8_t)e;        for (int j = 0; j < 16; j++)            out[i].qs[j] = (uint8_t)(mx_code(x[j] * inv) | mx_code(x[j + 16] * inv) << 4);    }}static const uint8_t *src;static uint8_t *dst;static int type, ncols;static long nrows, in_row, out_row;static void *worker(void *arg) {    const long t = (long)arg, nt = strtol(getenv("MIXSYN_THREADS"), NULL, 10);    float *row = malloc(sizeof(float) * ncols);    for (long r = nrows * t / nt; r < nrows * (t + 1) / nt; r++) {        if (type == 16) deq_iq2_xxs((const block_iq2_xxs *)(src + r * in_row), row, ncols / 256);        else deq_q2_K((const block_q2_K *)(src + r * in_row), row, ncols / 256);        quant_mxfp4(row, (block_mxfp4 *)(dst + r * out_row), ncols / 32);    }    free(row);    return NULL;}int main(int argc, char **argv) {    if (argc != 9) { fprintf(stderr, "usage: mixsyn SRC TYPE NCOLS NROWS SRC_OFF DST DST_OFF THREADS\n"); return 2; }    type = atoi(argv[2]);    ncols = atoi(argv[3]);    nrows = atol(argv[4]);    const long src_off = atol(argv[5]), dst_off = atol(argv[7]);    const int nt = atoi(argv[8]);    if ((type != 16 && type != 10) || ncols % 256) { fprintf(stderr, "bad type/ncols\n"); return 2; }    in_row = (long)ncols / 256 * (type == 16 ? 66 : 84);    out_row = (long)ncols / 32 * 17;    const long page = getpagesize(), in_bytes = in_row * nrows, out_bytes = out_row * nrows;    int fs = open(argv[1], O_RDONLY), fd = open(argv[6], O_RDWR);    if (fs < 0 || fd < 0) { perror("open"); return 1; }    const long base = src_off / page * page;    const uint8_t *map = mmap(NULL, in_bytes + (src_off - base), PROT_READ, MAP_PRIVATE, fs, base);    if (map == MAP_FAILED) { perror("mmap"); return 1; }    src = map + (src_off - base);    dst = malloc(out_bytes);    char nts[16];    snprintf(nts, sizeof nts, "%d", nt);    setenv("MIXSYN_THREADS", nts, 1);    pthread_t th[64];    for (long t = 0; t < nt; t++) pthread_create(&th[t], NULL, worker, (void *)t);    for (int t = 0; t < nt; t++) pthread_join(th[t], NULL);    for (long done = 0; done < out_bytes;) {        long left = out_bytes - done; ssize_t n = pwrite(fd, dst + done, left > (1L << 30) ? (1L << 30) : left, dst_off + done);        if (n <= 0) { perror("pwrite"); return 1; }        done += n;    }    fsync(fd);    printf("wrote %ld bytes at %ld\n", out_bytes, dst_off);    return 0;}
+// mixsyn SRC TYPE NCOLS NROWS SRC_OFF DST DST_OFF THREADS
+// Dequantizes one IQ2_XXS (16) or Q2_K (10) tensor of SRC and writes it as
+// MXFP4 (ds4 layout) into DST at DST_OFF. Synthetic data for speed and
+// loader tests only: the values are the Q2 weights, not DeepSeek's MXFP4.
+#include <fcntl.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include "iq2tab.h"
+
+typedef struct { uint8_t scales[16], qs[64]; uint16_t d, dmin; } block_q2_K;
+typedef struct { uint16_t d; uint16_t qs[32]; } block_iq2_xxs;
+typedef struct { uint8_t e; uint8_t qs[16]; } block_mxfp4;
+
+static const float mx_values[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+static float h2f(uint16_t h) { __fp16 v; memcpy(&v, &h, 2); return (float)v; }
+
+static void deq_q2_K(const block_q2_K *x, float *y, int nb) {
+    for (int i = 0; i < nb; i++) {
+        const float d = h2f(x[i].d), min = h2f(x[i].dmin);
+        const uint8_t *q = x[i].qs;
+        int is = 0;
+        for (int n = 0; n < 256; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc = x[i].scales[is++];
+                float dl = d * (sc & 0xF), ml = min * (sc >> 4);
+                for (int l = 0; l < 16; l++) *y++ = dl * ((q[l] >> shift) & 3) - ml;
+                sc = x[i].scales[is++];
+                dl = d * (sc & 0xF); ml = min * (sc >> 4);
+                for (int l = 0; l < 16; l++) *y++ = dl * ((q[l + 16] >> shift) & 3) - ml;
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+static void deq_iq2_xxs(const block_iq2_xxs *x, float *y, int nb) {
+    uint32_t aux32[2];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    for (int i = 0; i < nb; i++) {
+        const float d = h2f(x[i].d);
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            memcpy(aux32, x[i].qs + 4 * ib32, 8);
+            const float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> 7 * l) & 127];
+                for (int j = 0; j < 8; j++) y[j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                y += 8;
+            }
+        }
+    }
+}
+
+static uint8_t mx_code(float v) {
+    const float a = fabsf(v);
+    int best = 0;
+    for (int k = 1; k < 8; k++) if (fabsf(mx_values[k] - a) < fabsf(mx_values[best] - a)) best = k;
+    return (uint8_t)(best | (v < 0.0f && best ? 8 : 0));
+}
+
+static void quant_mxfp4(const float *x, block_mxfp4 *out, int nb) {
+    for (int i = 0; i < nb; i++, x += 32) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(x[j]));
+        int e = amax > 0.0f ? (int)ceilf(log2f(amax / 6.0f)) + 127 : 0;
+        if (e < 1) e = 1;
+        if (e > 254) e = 254;
+        const float inv = 1.0f / ldexpf(1.0f, e - 127);
+        out[i].e = (uint8_t)e;
+        for (int j = 0; j < 16; j++)
+            out[i].qs[j] = (uint8_t)(mx_code(x[j] * inv) | mx_code(x[j + 16] * inv) << 4);
+    }
+}
+
+static const uint8_t *src;
+static uint8_t *dst;
+static int type, ncols;
+static long nrows, in_row, out_row;
+
+static void *worker(void *arg) {
+    const long t = (long)arg, nt = strtol(getenv("MIXSYN_THREADS"), NULL, 10);
+    float *row = malloc(sizeof(float) * ncols);
+    for (long r = nrows * t / nt; r < nrows * (t + 1) / nt; r++) {
+        if (type == 16) deq_iq2_xxs((const block_iq2_xxs *)(src + r * in_row), row, ncols / 256);
+        else deq_q2_K((const block_q2_K *)(src + r * in_row), row, ncols / 256);
+        quant_mxfp4(row, (block_mxfp4 *)(dst + r * out_row), ncols / 32);
+    }
+    free(row);
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 9) { fprintf(stderr, "usage: mixsyn SRC TYPE NCOLS NROWS SRC_OFF DST DST_OFF THREADS\n"); return 2; }
+    type = atoi(argv[2]);
+    ncols = atoi(argv[3]);
+    nrows = atol(argv[4]);
+    const long src_off = atol(argv[5]), dst_off = atol(argv[7]);
+    const int nt = atoi(argv[8]);
+    if ((type != 16 && type != 10) || ncols % 256) { fprintf(stderr, "bad type/ncols\n"); return 2; }
+    in_row = (long)ncols / 256 * (type == 16 ? 66 : 84);
+    out_row = (long)ncols / 32 * 17;
+    const long page = getpagesize(), in_bytes = in_row * nrows, out_bytes = out_row * nrows;
+    int fs = open(argv[1], O_RDONLY), fd = open(argv[6], O_RDWR);
+    if (fs < 0 || fd < 0) { perror("open"); return 1; }
+    const long base = src_off / page * page;
+    const uint8_t *map = mmap(NULL, in_bytes + (src_off - base), PROT_READ, MAP_PRIVATE, fs, base);
+    if (map == MAP_FAILED) { perror("mmap"); return 1; }
+    src = map + (src_off - base);
+    dst = malloc(out_bytes);
+    char nts[16];
+    snprintf(nts, sizeof nts, "%d", nt);
+    setenv("MIXSYN_THREADS", nts, 1);
+    pthread_t th[64];
+    for (long t = 0; t < nt; t++) pthread_create(&th[t], NULL, worker, (void *)t);
+    for (int t = 0; t < nt; t++) pthread_join(th[t], NULL);
+    for (long done = 0; done < out_bytes;) {
+        long left = out_bytes - done; ssize_t n = pwrite(fd, dst + done, left > (1L << 30) ? (1L << 30) : left, dst_off + done);
+        if (n <= 0) { perror("pwrite"); return 1; }
+        done += n;
+    }
+    fsync(fd);
+    printf("wrote %ld bytes at %ld\n", out_bytes, dst_off);
+    return 0;
+}
