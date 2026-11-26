@@ -23,7 +23,7 @@ All numbers below are live **output generation** speeds (not prefill) on a singl
 
 ## Memory Footprint (`1,048,576 × 6` Resident on 256 GiB)
 
-- **Mixed `Q2 + L30–39 MXFP4` (benchmarked):** `230.6 GiB` loaded (`200.9 GiB` idle) → **25+ GiB free**, `< 5 MiB` swap.
+- **Mixed `Q2 + L30–39 MXFP4` + resident vision (`926 MiB`) + DSpark (`8.0 GB`):** `230.6 GiB` loaded (`200.9 GiB` idle) → **25+ GiB free**, `< 5 MiB` swap.
 - **Stock pure `Q2` (`ds41f-q2`):** `151.8 GiB` weights (**31.6 GiB less resident RAM**, `~199 GiB` total) → **~57 GiB free**.
 - **All 6 × 1M context slots:** `31.45 GiB` total (`3.13 GiB`/slot + shared workspace), including **−3.75 GiB** saved via bit-exact BF16 `index_cache`.
 - **Disk KV cache (`A44`):** `3,192 B/tok` (**−50%** vs. legacy `A41`), fitting ~16M cached tokens in 50 GiB.
@@ -32,7 +32,7 @@ All numbers below are live **output generation** speeds (not prefill) on a singl
 
 - **Metal 4 decode & prefill kernels:** Zero-shmem 1-SG multi-row Q8_0 / F16 kernels (`M=2..8`), fused shared-expert SwiGLU, bit-exact narrow BF16 router + E4M3 `engram_kv` / `indexer_q_b`, single-GPU MXFP4 packed TensorOps MPP prefill, bit-exact BF16 `index_cache`, and empirically gated `rows4` long-context indexer.
 - **Lossless DSpark + 6-gram PLD speculation:** 8-row verify budget, incremental `< 0.01 ms` 3-gram index with 6-gram PLD fast path + hybrid tail, 59.2% pruned DSpark draft vocab (full 129,280 exact verification), deferred correction token, smart backoff with code-token instant wakeup, and **`c=2` exact-sampling batched speculation** (`0%` regression at `c=3..6`).
-- **Smart KV & instant rewind (`A44`):** 10 tiered in-RAM anchors per slot (`~0.1 ms` Stop / Edit / Fork rewind), preserved sessions across cancellation, warm 128-row DSpark ring persisted in anchors and disk cache, and `iogpu.wired_limit_mb` admission honoring a 16 GiB OS floor.
+- **Smart KV, vision & instant rewind (`A44`):** 10 tiered in-RAM anchors per slot (`~0.1 ms` Stop / Edit / Fork rewind) with **vision-fingerprint matching** for multimodal chats, preserved sessions across cancellation, warm 128-row DSpark ring persisted in anchors and disk cache, and `iogpu.wired_limit_mb` admission honoring a 16 GiB OS floor.
 
 ## Quick Start (macOS 27+ / Metal 4)
 
@@ -41,7 +41,7 @@ git clone https://github.com/festim-jetishi/ds4-m5-ultra.git
 cd ds4-m5-ultra
 make -j8 ds4-server
 
-# 1. Pure Q2 base (151.8 GiB RAM — 31.6 GiB leaner than mixed) + optional vision
+# 1. Pure Q2 base (151.8 GiB RAM — 31.6 GiB leaner than mixed) + separate 926 MiB vision encoder
 ./download_model.sh ds41f-q2
 ./download_model.sh ds41f-vision
 
