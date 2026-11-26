@@ -1,3 +1,13 @@
+> **Mac Studio M5 Ultra Fork (`ds4-m5-ultra`)** — Based on [`antirez/ds4`](https://github.com/antirez/ds4) (`5379c1c`), adding 19 lossless Metal 4, DSpark + 6-gram PLD, smart KV cache (`A44`), `c=2` exact-sampling batched speculation, and native `1,048,576 × 6` context optimizations for Apple Silicon (256 GiB).
+>
+> - **115–133 tok/s** Rust refactoring/edits (8K–44K) · **70–88 tok/s** brand-new Rust (8K–83K) · **100% `--mtp-exact-sampling`**
+> - **96–99 tok/s** at `c=2` (+13–26%) · **144–148 tok/s** at `c=6` mixed (**~127 tok/s** at `6 × 40K` Rust = `240K` live ctx) · **0.69 s** 44K Stop + Refine (`50×` vs. cold)
+> - See **[`M5_ULTRA.md`](M5_ULTRA.md)** for the full optimization breakdown, verified benchmarks, and **[`deploy/macos-256gb/`](deploy/macos-256gb/)** for the 256 GiB `launchd` setup.
+>
+> ![Mac Studio M5 Ultra Rust Output Decode Speed](docs/mac-studio-rust-decode-card.png)
+
+---
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>

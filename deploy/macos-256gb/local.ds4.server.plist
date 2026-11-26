@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>Label</key>
+	<string>local.ds4.server</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__DS4_DIR__/ds4-server</string>
+		<string>-m</string>
+		<string>gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4-abliterated.gguf</string>
+		<string>--host</string>
+		<string>0.0.0.0</string>
+		<string>--port</string>
+		<string>8000</string>
+		<string>--ctx</string>
+		<string>1048576</string>
+		<string>--batched-session</string>
+		<string>6</string>
+		<string>--dspark</string>
+		<string>--mtp-model</string>
+		<string>gguf/DeepSeek-V4.1-Flash-1017-DSpark.gguf</string>
+		<string>--mtp-exact-sampling</string>
+		<string>--dspark-confidence</string>
+		<string>0.4</string>
+		<string>--kv-disk-dir</string>
+		<string>__HOME__/.ds4/server-kv</string>
+		<string>--kv-disk-space-mb</string>
+		<string>51200</string>
+		<string>--kv-cache-cold-max-tokens</string>
+		<string>262144</string>
+		<string>--vision</string>
+		<string>gguf/DeepSeek-V4.1-Flash-Vision.gguf</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/ds4-server.log</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/ds4-server.log</string>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>WorkingDirectory</key>
+	<string>__DS4_DIR__</string>
+</dict>
+</plist>
