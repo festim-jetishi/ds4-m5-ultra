@@ -85,12 +85,12 @@ make test-mxfp4-metal
 ### 2. Exact Software & Model Requirements (for 1:1 Performance)
 - **macOS & Toolchain:** **macOS 27+** (Metal 4 `mpp::tensor_ops` / NAX required — tested on macOS 27.0.1, Apple clang 21.0.0) on AC power (`lowpowermode=0`, `sleep=0`).
 - **No hidden environment variables:** Every optimization is enabled by default in `ds4-server` (zero `DS4_*` or `MTL_*` env vars required).
-- **Exact GGUF files in `gguf/`:**
+- **Exact GGUF files in `gguf/` (Hugging Face sources):**
   1. **Main model (`-m`):**
-     - *Benchmarked mixed quant (`183.4 GiB` resident, `372 GB` on disk incl. SSD Engram tables):* `gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4.gguf` — layers 0–29 in `IQ2_XXS`/`Q2_K` + layers 30–39 in `MXFP4`, spliced via [`gguf-tools/mixed/splice_mixed_expert_layers_gguf.py`](gguf-tools/mixed/splice_mixed_expert_layers_gguf.py) (from `deepseek41_quantize.py`).
-     - *Stock alternative:* `./download_model.sh ds41f-q2` downloads `gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf` (all 40 layers in Q2 — uses less RAM and decodes slightly faster).
-  2. **DSpark drafter (`--mtp-model`, `8.0 GB`):** `gguf/DeepSeek-V4.1-Flash-1017-DSpark.gguf` — extracted losslessly from the DeepSeek-V4.1-Flash checkpoint via [`gguf-tools/deepseek41_dspark.py`](gguf-tools/deepseek41_dspark.py).
-  3. **Vision encoder (`--vision`, `926 MB`, optional):** `./download_model.sh ds41f-vision` → `gguf/DeepSeek-V4.1-Flash-Vision.gguf`.
+     - *Stock pure Q2 (`151.8 GiB` resident — **31.6 GiB less RAM** and slightly faster decode):* `./download_model.sh ds41f-q2` or direct from [`antirez/deepseek-v4.1-flash-gguf`](https://huggingface.co/antirez/deepseek-v4.1-flash-gguf/blob/main/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf) → `gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf`.
+     - *Benchmarked mixed quant (`183.4 GiB` resident, `372 GB` on disk incl. SSD Engram tables):* `gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4.gguf` — layers 0–29 from the pure Q2 base + layers 30–39 spliced from the [`MXFP4-experts` shards](https://huggingface.co/antirez/deepseek-v4.1-flash-gguf/tree/main) via [`gguf-tools/mixed/splice_mixed_expert_layers_gguf.py`](gguf-tools/mixed/splice_mixed_expert_layers_gguf.py).
+  2. **DSpark drafter (`--mtp-model`, `8.0 GB`):** `gguf/DeepSeek-V4.1-Flash-1017-DSpark.gguf` — extracted losslessly from [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/tree/1bae0e1088993b9b82de08f59de5be5a34e42170) via [`gguf-tools/deepseek41_dspark.py`](gguf-tools/deepseek41_dspark.py).
+  3. **Vision encoder (`--vision`, `926 MiB`, optional):** `./download_model.sh ds41f-vision` or direct from [`antirez/deepseek-v4.1-flash-gguf`](https://huggingface.co/antirez/deepseek-v4.1-flash-gguf/blob/main/DeepSeek-V4.1-Flash-Vision.gguf) → `gguf/DeepSeek-V4.1-Flash-Vision.gguf`.
 
 ### 3. Unlock `1M × 6` Wired Limit & Install `launchd` Services (256 GiB Mac Studio)
 Sanitized templates live in [`deploy/macos-256gb/`](deploy/macos-256gb/):
