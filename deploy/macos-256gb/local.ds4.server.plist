@@ -15,7 +15,7 @@
 	<array>
 		<string>__DS4_DIR__/ds4-server</string>
 		<string>-m</string>
-		<string>gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4-abliterated.gguf</string>
+		<string>gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4.gguf</string>
 		<string>--host</string>
 		<string>0.0.0.0</string>
 		<string>--port</string>

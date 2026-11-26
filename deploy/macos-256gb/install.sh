@@ -26,11 +26,11 @@ if [[ ! -x "${DS4_DIR}/ds4-server" ]]; then
   make -C "${DS4_DIR}" -j8 ds4-server
 fi
 
-echo "1/2 Installing LaunchDaemon (iogpu.wired_limit_mb=241664 = 236 GiB, 20 GiB OS floor)..."
+echo "1/2 Installing LaunchDaemon (iogpu.wired_limit_mb=241664 + disable_wired_collector=1)..."
 sudo cp "${SCRIPT_DIR}/local.ds4.iogpu-wired-limit.plist" /Library/LaunchDaemons/local.ds4.iogpu-wired-limit.plist
 sudo chown root:wheel /Library/LaunchDaemons/local.ds4.iogpu-wired-limit.plist
 sudo chmod 644 /Library/LaunchDaemons/local.ds4.iogpu-wired-limit.plist
-sudo sysctl -w iogpu.wired_limit_mb=241664
+sudo sysctl -w iogpu.wired_limit_mb=241664 iogpu.disable_wired_collector=1
 sudo launchctl bootout system/local.ds4.iogpu-wired-limit 2>/dev/null || true
 sudo launchctl bootstrap system /Library/LaunchDaemons/local.ds4.iogpu-wired-limit.plist
 

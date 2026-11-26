@@ -82,15 +82,19 @@ make test-mxfp4-metal
 ./tests/test_session_state
 ```
 
-### 2. Download Models
-Follow upstream [`antirez/ds4`](https://github.com/antirez/ds4) instructions (`./download_model.sh`) to place the DeepSeek V4.1 Flash checkpoint, DSpark drafter, and optional Vision GGUF inside `gguf/`:
-- `gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4-abliterated.gguf`
-- `gguf/DeepSeek-V4.1-Flash-1017-DSpark.gguf`
-- `gguf/DeepSeek-V4.1-Flash-Vision.gguf` *(optional)*
+### 2. Exact Software & Model Requirements (for 1:1 Performance)
+- **macOS & Toolchain:** **macOS 27+** (Metal 4 `mpp::tensor_ops` / NAX required — tested on macOS 27.0.1, Apple clang 21.0.0) on AC power (`lowpowermode=0`, `sleep=0`).
+- **No hidden environment variables:** Every optimization is enabled by default in `ds4-server` (zero `DS4_*` or `MTL_*` env vars required).
+- **Exact GGUF files in `gguf/`:**
+  1. **Main model (`-m`):**
+     - *Benchmarked mixed quant (`183.4 GiB` resident, `372 GB` on disk incl. SSD Engram tables):* `gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4.gguf` — layers 0–29 in `IQ2_XXS`/`Q2_K` + layers 30–39 in `MXFP4`, spliced via [`gguf-tools/mixed/splice_mixed_expert_layers_gguf.py`](gguf-tools/mixed/splice_mixed_expert_layers_gguf.py) (from `deepseek41_quantize.py`).
+     - *Stock alternative:* `./download_model.sh ds41f-q2` downloads `gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf` (all 40 layers in Q2 — uses less RAM and decodes slightly faster).
+  2. **DSpark drafter (`--mtp-model`, `8.0 GB`):** `gguf/DeepSeek-V4.1-Flash-1017-DSpark.gguf` — extracted losslessly from the DeepSeek-V4.1-Flash checkpoint via [`gguf-tools/deepseek41_dspark.py`](gguf-tools/deepseek41_dspark.py).
+  3. **Vision encoder (`--vision`, `926 MB`, optional):** `./download_model.sh ds41f-vision` → `gguf/DeepSeek-V4.1-Flash-Vision.gguf`.
 
 ### 3. Unlock `1M × 6` Wired Limit & Install `launchd` Services (256 GiB Mac Studio)
 Sanitized templates live in [`deploy/macos-256gb/`](deploy/macos-256gb/):
-- [`deploy/macos-256gb/local.ds4.iogpu-wired-limit.plist`](deploy/macos-256gb/local.ds4.iogpu-wired-limit.plist) — sets `sysctl -w iogpu.wired_limit_mb=241664` (`236 GiB`) at boot so 6 × 1M slots fit with `20 GiB` OS floor.
+- [`deploy/macos-256gb/local.ds4.iogpu-wired-limit.plist`](deploy/macos-256gb/local.ds4.iogpu-wired-limit.plist) — sets **both** `iogpu.wired_limit_mb=241664` (`236 GiB` wired cap, `20 GiB` OS floor) **and** `iogpu.disable_wired_collector=1` (prevents macOS IOGPU from reclaiming resident Metal buffers near 230 GiB) at boot.
 - [`deploy/macos-256gb/local.ds4.server.plist`](deploy/macos-256gb/local.ds4.server.plist) — production `ds4-server` LaunchAgent (`1M × 6`, `--dspark`, `--mtp-exact-sampling`, 50 GiB `A44` disk KV cache).
 - [`deploy/macos-256gb/install.sh`](deploy/macos-256gb/install.sh) — checks for ≥ 256 GiB RAM, substitutes your checkout path & `$HOME`, and bootstraps both services.
 
@@ -99,10 +103,10 @@ Sanitized templates live in [`deploy/macos-256gb/`](deploy/macos-256gb/):
 ./deploy/macos-256gb/install.sh
 ```
 
-Or run manually in the foreground (after `sudo sysctl -w iogpu.wired_limit_mb=241664`):
+Or run manually in the foreground (after `sudo sysctl -w iogpu.wired_limit_mb=241664 iogpu.disable_wired_collector=1`):
 ```bash
 ./ds4-server \
-  -m gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4-abliterated.gguf \
+  -m gguf/DeepSeek-V4.1-Flash-1017-Q2-L30-39-MXFP4.gguf \
   --host 0.0.0.0 --port 8000 \
   --ctx 1048576 --batched-session 6 \
   --dspark --mtp-model gguf/DeepSeek-V4.1-Flash-1017-DSpark.gguf \
